@@ -1,18 +1,16 @@
 import streamlit as st
 import requests
-import json
 import re
 from cvss import CVSS3
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import PromptTemplate
 from rag_retrieval import (
     DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_TOP_K,
     filtered_metadata,
     retrieve_asset_context,
 )
+from llm_assessment import LlmAssessmentError, analyze_with_llm
 
 # ==========================================
 # 1. SETUP & CACHING (Agar aplikasi cepat)
@@ -107,41 +105,6 @@ def build_modified_vector(original_vector, asset_metadata):
     if av == "N" and zone in ("restricted", "internal"):
         modified += "/MAV:A"
     return modified
-
-def analyze_with_llm(api_key, cve_desc, original_vector, modified_vector, asset_context):
-    """LLM only provides justification/remediation. Vector math is deterministic."""
-    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0)
-    
-    template = """
-    Anda adalah Senior Cybersecurity Analyst. Jelaskan dampak kontekstual, JANGAN memodifikasi vektor.
-    DILARANG KERAS menghitung skor angka atau mengubah string vektor.
-
-    INPUT:
-    - CVE Description: {cve_desc}
-    - Original Vector: {original_vector}
-    - Modified Vector (deterministik, sudah final): {modified_vector}
-    - Asset Context: {asset_context}
-
-    OUTPUT HARUS berupa JSON valid persis seperti format ini, tanpa markdown block (```json):
-    {{
-      "justification": "Alasan nilai CR, IR, AR, MAV pada modified vector berdasarkan aset.",
-      "nist_impact_level": "High",
-      "remediation": "Langkah mitigasi."
-    }}
-    """
-    prompt = PromptTemplate(template=template, input_variables=["cve_desc", "original_vector", "modified_vector", "asset_context"])
-    chain = prompt | llm
-
-    response = chain.invoke({
-        "cve_desc": cve_desc,
-        "original_vector": original_vector,
-        "modified_vector": modified_vector,
-        "asset_context": json.dumps(asset_context)
-    })
-    
-    # Membersihkan output jika LLM bandel menambahkan markdown ```json
-    clean_json = re.sub(r'```json|```', '', response.content).strip()
-    return json.loads(clean_json)
 
 # ==========================================
 # 3. ANTARMUKA STREAMLIT
@@ -248,14 +211,14 @@ with col_output:
                     # Hitung selisih untuk visualisasi
                     delta_score = round(context_score - base_score, 1)
                     m2.metric("Context-Aware Score", f"{context_score}", delta=f"{delta_score} (Env)", delta_color="inverse")
-                    m3.metric("Business Impact", llm_result["nist_impact_level"], delta_color="off")
+                    m3.metric("Business Impact", llm_result.nist_impact_level.value, delta_color="off")
                     
                     tab1, tab2, tab3 = st.tabs(["📝 Justifikasi Risiko", "🧮 Vektor Final", "🗄️ Konteks Aset (RAG)"])
                     with tab1:
                         st.markdown("**Analisis LLM:**")
-                        st.info(llm_result["justification"])
+                        st.info(llm_result.justification)
                         st.markdown("**Rekomendasi Mitigasi:**")
-                        st.warning(llm_result["remediation"])
+                        st.warning(llm_result.remediation)
                     with tab2:
                         st.code(f"Original : {base_vector}\nModified : {modified_vector_str}", language="text")
                     with tab3:
@@ -272,6 +235,8 @@ with col_output:
                             st.write(f"{marker} `{c.metadata.get('asset_id', '?')}` "
                                      f"{c.metadata.get('asset_name', '?')} — confidence={c.confidence:.3f}")
                 
+                except LlmAssessmentError as e:
+                    st.error(f"Analisis LLM ditolak/tidak valid, kalkulasi CVSS dihentikan: {str(e)}")
                 except Exception as e:
                     st.error(f"Terjadi kesalahan saat memproses data: {str(e)}")
     else:
