@@ -1,0 +1,8 @@
+asset_id,asset_name,ip_address,network_zone,business_criticality,data_sensitivity,description
+SRV-001,Payment Gateway Database,10.0.50.11,Restricted,Mission Critical,Restricted,"Database utama yang menyimpan transaksi kartu kredit dan data finansial pelanggan (PCI-DSS). Terisolasi secara ketat dari internet."
+SRV-002,Corporate Web Portal,192.168.1.100,DMZ,High,Public,"Server web publik untuk profil perusahaan dan portal login nasabah. Menghadap langsung ke jaringan internet publik."
+SRV-003,Employee Cafeteria Menu,10.0.10.5,Internal,Low,Internal,"Aplikasi web internal sederhana untuk melihat menu makan siang karyawan di kantin. Tidak memiliki akses ke data penting."
+SRV-004,Active Directory DC,10.0.50.10,Restricted,Mission Critical,Restricted,"Domain Controller utama yang mengatur otentikasi IAM, policy, dan hak akses seluruh jaringan perusahaan."
+SRV-005,HR Document Storage,10.0.20.15,Internal,High,Confidential,"File server yang menyimpan dokumen kontrak kerja, slip gaji, dan data pribadi karyawan (PII)."
+SRV-006,Marketing Blog Server,192.168.1.105,DMZ,Medium,Public,"Server CMS WordPress untuk mempublikasikan artikel blog marketing dan siaran pers perusahaan."
+SRV-007,CCTV Management Server,10.0.30.22,Internal,Medium,Internal,"Server untuk menyimpan rekaman dan mengelola feed video dari kamera pengawas di seluruh area gedung kantor."
