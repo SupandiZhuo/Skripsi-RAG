@@ -1,6 +1,5 @@
 import streamlit as st
 import requests
-import re
 from cvss import CVSS3
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -10,7 +9,7 @@ from rag_retrieval import (
     filtered_metadata,
     retrieve_asset_context,
 )
-from llm_assessment import LlmAssessmentError, analyze_with_llm
+from llm_assessment import ContextualAssessment, LlmAssessmentError, analyze_with_llm
 
 # ==========================================
 # 1. SETUP & CACHING (Agar aplikasi cepat)
@@ -62,48 +61,29 @@ def fetch_cve_from_nvd(cve_id):
     except Exception as e:
         return None, str(e)
 
-def _norm(s):
-    return str(s or "").strip().lower()
+def build_environmental_vector(original_vector, assessment: ContextualAssessment):
+    """Deterministic Environmental vector construction.
 
-def build_modified_vector(original_vector, asset_metadata):
-    """Deterministic CR/IR/AR/MAV mapping. Base metrics from NVD are never altered."""
+    Appends the model-assessed CR/IR/AR (already schema-validated to
+    X/L/M/H by ContextualAssessment) onto the preserved NVD Base vector.
+    Base metrics (AV/AC/PR/UI/S/C/I/A) are NEVER modified, and MAV is left
+    undefined (X) in this prototype - no MAV inference is performed.
+    """
     if not original_vector or not original_vector.strip().startswith("CVSS:3."):
         raise ValueError("Base Vector NVD tidak valid.")
-    # Validate base vector parses
+    # Validate base vector parses before any modification
     CVSS3(original_vector.strip())
-    asset_metadata = asset_metadata or {}
-    sensitivity = _norm(asset_metadata.get("data_sensitivity"))
-    criticality = _norm(asset_metadata.get("business_criticality"))
-    zone = _norm(asset_metadata.get("network_zone"))
 
-    if sensitivity in ("restricted", "confidential"):
-        cr_ir = "CR:H/IR:H"
-    elif sensitivity == "internal":
-        cr_ir = "CR:M/IR:M"
-    elif sensitivity == "public":
-        cr_ir = "CR:L/IR:L"
-    else:
-        cr_ir = "CR:X/IR:X"
-
-    if criticality in ("mission critical", "high"):
-        ar = "AR:H"
-    elif criticality == "medium":
-        ar = "AR:M"
-    elif criticality == "low":
-        ar = "AR:L"
-    else:
-        ar = "AR:X"
-
-    # Strip any pre-existing environmental overrides to keep idempotent
+    # Strip any pre-existing environmental metrics to keep this idempotent;
+    # only CR/IR/AR are (re)appended - MAV is intentionally never set here.
     parts = original_vector.strip().split("/")
     base_parts = [p for p in parts if not p.startswith(("CR:", "IR:", "AR:", "MAV:"))]
-    modified = "/".join(base_parts) + f"/{cr_ir}/{ar}"
 
-    # Deterministic MAV: AV:N exposed to internet (DMZ) stays N; isolated zones become A
-    m = re.search(r"/AV:([NALP])", "/" + "/".join(base_parts))
-    av = m.group(1) if m else ""
-    if av == "N" and zone in ("restricted", "internal"):
-        modified += "/MAV:A"
+    cr = assessment.confidentiality_requirement.value
+    ir = assessment.integrity_requirement.value
+    ar = assessment.availability_requirement.value
+
+    modified = "/".join(base_parts) + f"/CR:{cr}/IR:{ir}/AR:{ar}"
     return modified
 
 # ==========================================
@@ -191,36 +171,49 @@ with col_output:
 
             with st.spinner("Menganalisis dengan LLM..."):
                 try:
-                    # 2. DETERMINISTIC VECTOR (LLM tidak boleh mengubah vektor)
-                    modified_vector_str = build_modified_vector(base_vector, asset_metadata)
+                    # 2. LLM CONTEXTUAL ASSESSMENT (NVD info + RAG evidence -> CR/IR/AR + priority only;
+                    # the model never sees/produces a CVSS vector or numeric score)
+                    llm_result = analyze_with_llm(api_key, cve_description, base_vector, asset_metadata)
 
-                    # 3. LLM GENERATION (hanya justifikasi/remediasi)
-                    llm_result = analyze_with_llm(api_key, cve_description, base_vector, modified_vector_str, asset_metadata)
+                    # 3. DETERMINISTIC ENVIRONMENTAL VECTOR (LLM tidak boleh mengubah Base/MAV)
+                    modified_vector_str = build_environmental_vector(base_vector, llm_result)
 
                     # 4. DETERMINISTIC MATH CALCULATION
                     # Kita gunakan library python CVSS untuk menghitung skor akhir dari string deterministik
                     cvss_obj = CVSS3(modified_vector_str)
                     base_cvss, temporal_cvss, environmental_cvss = cvss_obj.scores()
+                    base_severity, _, env_severity = cvss_obj.severities()
                     context_score = environmental_cvss
-                    
+
                     # UI Rendering
                     st.success("Analisis Selesai!")
                     m1, m2, m3 = st.columns(3)
-                    m1.metric("Base CVSS (NVD)", f"{base_score}", delta_color="off")
-                    
+                    m1.metric("Base CVSS (NVD)", f"{base_score}", delta=base_severity, delta_color="off")
+
                     # Hitung selisih untuk visualisasi
                     delta_score = round(context_score - base_score, 1)
-                    m2.metric("Context-Aware Score", f"{context_score}", delta=f"{delta_score} (Env)", delta_color="inverse")
-                    m3.metric("Business Impact", llm_result.nist_impact_level.value, delta_color="off")
-                    
+                    m2.metric(
+                        "Context-Aware Score",
+                        f"{context_score}",
+                        delta=f"{env_severity} ({delta_score:+})",
+                        delta_color="inverse",
+                    )
+                    m3.metric("Organizational Priority", llm_result.organizational_priority.value, delta_color="off")
+
                     tab1, tab2, tab3 = st.tabs(["📝 Justifikasi Risiko", "🧮 Vektor Final", "🗄️ Konteks Aset (RAG)"])
                     with tab1:
+                        st.markdown("**CR / IR / AR (ditentukan model):**")
+                        st.write(
+                            f"CR: `{llm_result.confidentiality_requirement.value}`  "
+                            f"IR: `{llm_result.integrity_requirement.value}`  "
+                            f"AR: `{llm_result.availability_requirement.value}`"
+                        )
                         st.markdown("**Analisis LLM:**")
                         st.info(llm_result.justification)
                         st.markdown("**Rekomendasi Mitigasi:**")
                         st.warning(llm_result.remediation)
                     with tab2:
-                        st.code(f"Original : {base_vector}\nModified : {modified_vector_str}", language="text")
+                        st.code(f"Original     : {base_vector}\nEnvironmental: {modified_vector_str}", language="text")
                     with tab3:
                         st.markdown(
                             f"**Aset terpilih:** `{best.metadata.get('asset_id', '?')}` "
