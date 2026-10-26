@@ -29,7 +29,7 @@ from langchain_core.prompts import PromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field, field_validator
 
-DEFAULT_MODEL = "gemini-2.0-flash"
+DEFAULT_MODEL = "gemini-3.6-flash"
 
 
 class CiaRequirement(str, Enum):
@@ -99,7 +99,22 @@ DILARANG KERAS:
 INPUT:
 - CVE Description: {cve_desc}
 - Original NVD CVSS Vector (Base, JANGAN diubah): {original_vector}
-- Retrieved Organizational Asset Context (RAG): {asset_context}
+- Retrieved Organizational Asset Context (RAG, Asset Schema v2): {asset_context}
+
+ATURAN KONTEKS ASET (Schema v2):
+- confidentiality_requirement / integrity_requirement / availability_requirement
+  pada konteks aset adalah baseline organisasi. Nilai selain "X" wajib
+  dipertahankan atau dinaikkan (bukan diturunkan) dan disebutkan buktinya di
+  justification. "X" berarti baseline tidak ditetapkan; tentukan dari konteks
+  lain. "unknown" berarti informasi tidak tersedia - jangan mengarang.
+- internet_exposed, network_zone, dan asset_type adalah bukti paparan; jangan
+  mengubah metrik Base dan jangan menyimpulkan MAV.
+- data_sensitivity, data_classification, business_function, business_criticality
+  adalah bukti dimensi CIA dan prioritas organisasi.
+- vendor / software_name / software_version / cpe adalah bukti kecocokan
+  perangkat lunak terhadap CVE.
+- is_synthetic=true menandai data sampel sintetis; source/last_updated adalah
+  provenance konteks.
 
 Berdasarkan HANYA pada input di atas, tentukan:
 - confidentiality_requirement (CR): X, L, M, atau H

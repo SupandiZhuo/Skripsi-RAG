@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Generated / runtime artifacts
+chroma_db/
+data/assessment_history.json
+
+# Tooling
+.opencode/
+.vscode/

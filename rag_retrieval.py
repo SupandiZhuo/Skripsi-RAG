@@ -18,10 +18,13 @@ Scoring notes (verified against the installed langchain-chroma/chromadb version)
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 DEFAULT_TOP_K = 3
 DEFAULT_CONFIDENCE_THRESHOLD = 0.15
+
+# Runtime extension field for editable software inventory (Phase B1).
+SOFTWARE_INVENTORY_FIELD = "software_inventory_json"
 
 
 @dataclass
@@ -51,17 +54,38 @@ class RetrievalResult:
         return self.best is not None and self.best.confidence >= self.threshold
 
 
-# Metadata fields relevant to the vulnerability-assessment context. Fields not
-# present in the underlying asset dataset are simply omitted (kept optional).
+# Metadata fields relevant to the vulnerability-assessment context (Asset
+# Schema v2). Fields not present in the underlying asset document are simply
+# omitted (kept optional), so v1 documents keep working while v2 documents
+# expose the full evidence: identity, placement, business function, software
+# inventory (CPE applicability), declared CVSS Environmental Requirement
+# baseline (CR/IR/AR), and provenance/freshness.
 CONTEXT_METADATA_FIELDS = [
     "asset_id",
     "asset_name",
-    "environment",
-    "internet_exposed",
+    "ip_address",
+    "network_zone",
     "business_criticality",
     "data_sensitivity",
-    "network_zone",
-    "ip_address",
+    "environment",
+    "internet_exposed",
+    "asset_type",
+    "owner",
+    "business_function",
+    "vendor",
+    "software_name",
+    "software_version",
+    "cpe",
+    "data_classification",
+    "confidentiality_requirement",
+    "integrity_requirement",
+    "availability_requirement",
+    "software_inventory_json",
+    "source",
+    "source_reference",
+    "last_updated",
+    "is_synthetic",
+    "schema_version",
 ]
 
 
@@ -113,3 +137,75 @@ def filtered_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
     """Return only the organizational-context fields relevant to CVSS/priority
     logic, in a stable order, keeping only fields actually present."""
     return {k: metadata[k] for k in CONTEXT_METADATA_FIELDS if k in metadata}
+
+
+def list_all_assets(vector_store) -> List[Dict[str, Any]]:
+    """Return all asset metadata records from the vector store.
+
+    Tries the public `get()` API first, then falls back to the underlying
+    Chroma collection for older langchain-chroma versions. Missing/None
+    metadata entries are skipped.
+    """
+    if vector_store is None:
+        return []
+    try:
+        data = vector_store.get()
+    except Exception:
+        try:
+            data = vector_store._collection.get()
+        except Exception:
+            return []
+    if not isinstance(data, dict):
+        return []
+    metadatas = data.get("metadatas") or []
+    return [dict(m) for m in metadatas if m]
+
+
+def _document_id(asset_id: str) -> str:
+    return f"asset:{asset_id}"
+
+
+def _collection(vector_store) -> Any:
+    """Return the underlying Chroma collection object."""
+    return getattr(vector_store, "_collection", vector_store)
+
+
+def get_asset_by_id(vector_store, asset_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single asset's metadata by its asset_id."""
+    if vector_store is None or not asset_id:
+        return None
+    collection = _collection(vector_store)
+    doc_id = _document_id(asset_id)
+    try:
+        data = collection.get(ids=[doc_id], include=["metadatas"])
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    ids = data.get("ids") or []
+    metadatas = data.get("metadatas") or []
+    if ids and metadatas and ids[0] == doc_id:
+        return dict(metadatas[0])
+    return None
+
+
+def update_asset_metadata(
+    vector_store,
+    asset_id: str,
+    metadata_updates: Mapping[str, Any],
+) -> bool:
+    """Update metadata fields for a single asset in ChromaDB.
+
+    Only the fields present in `metadata_updates` are overwritten; other fields
+    are preserved by the Chroma update call. The document ID follows the
+    ingestion convention `asset:<asset_id>`.
+    """
+    if vector_store is None or not asset_id:
+        return False
+    collection = _collection(vector_store)
+    doc_id = _document_id(asset_id)
+    try:
+        collection.update(ids=[doc_id], metadatas=[dict(metadata_updates)])
+        return True
+    except Exception:
+        return False
