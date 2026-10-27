@@ -1,10 +1,41 @@
+# Streamlit owns the colors for ALL widgets, including dataframe and selectbox.
+# Switch between Light and Dark from the top-right ⋮ menu > Settings > Theme.
+# No account or app login is required.
 [theme]
 base = "light"
+font = "sans-serif"
+# Native Streamlit 1.66+ layout: gap BELOW header/three-dot menu.
+# Header clearance remains intact, preventing overlap with Add Asset.
+paddingTop = "0.5rem"
+paddingBottom = "2.5rem"
+
+[theme.light]
 primaryColor = "#2563eb"
 backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f8fafc"
-textColor = "#0f172a"
-font = "sans serif"
+secondaryBackgroundColor = "#f6f8fb"
+textColor = "#14213d"
+
+[theme.light.sidebar]
+paddingTop = "0.25rem"
+backgroundColor = "#f5f8fc"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#14213d"
+
+[theme.dark]
+primaryColor = "#60a5fa"
+backgroundColor = "#0d1117"
+secondaryBackgroundColor = "#161b22"
+textColor = "#e6edf3"
+
+[theme.dark.sidebar]
+paddingTop = "0.25rem"
+backgroundColor = "#161b22"
+secondaryBackgroundColor = "#0d1117"
+textColor = "#e6edf3"
+
+# Local single-user UI: keep theme/print options but hide developer actions.
+[client]
+toolbarMode = "viewer"
 
 [server]
-enableStaticServing = true
+enableStaticServing = false

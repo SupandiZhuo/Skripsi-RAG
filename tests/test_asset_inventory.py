@@ -2,14 +2,17 @@
 
 Covers: software inventory serialization, CPE validation, CPE collection from
 legacy + inventory fields, and ChromaDB metadata update/persistence.
-Integration tests use the real `corporate_assets_v2` collection, which must
-have been ingested via `python ingest_assets.py --v2`.
+Integration tests ingest fresh temporary collections with dummy embeddings.
 Run: python -m pytest test_asset_inventory.py -q
 """
 
-import pytest
+from pathlib import Path
 
-from app import load_all_assets_metadata, load_vector_db
+import pytest
+from langchain_chroma import Chroma
+
+from ingest_assets import COLLECTION_NAME, COLLECTION_NAME_V2, ingest_v2_to_chromadb
+from test_ingest_assets_v2 import DummyEmbeddings
 from asset_inventory import (
     SOFTWARE_INVENTORY_FIELD,
     collect_asset_cpes,
@@ -94,9 +97,21 @@ def test_collect_asset_cpes_skips_invalid_and_unknown():
 # ---------------------------------------------------------------------------
 # ChromaDB integration
 # ---------------------------------------------------------------------------
-@pytest.fixture(scope="module")
-def vector_store():
-    return load_vector_db()
+@pytest.fixture
+def vector_store(tmp_path):
+    return ingest_v2_to_chromadb(
+        csv_file=str(Path(__file__).resolve().parents[1] / "data" / "asset_data_v2.csv"),
+        collection_name=COLLECTION_NAME_V2,
+        persist_directory=str(tmp_path),
+        embeddings=DummyEmbeddings(),
+    )
+
+
+def reopen_store(tmp_path, collection=COLLECTION_NAME_V2):
+    return Chroma(
+        collection_name=collection, persist_directory=str(tmp_path),
+        embedding_function=DummyEmbeddings(), create_collection_if_not_exists=False,
+    )
 
 
 def test_get_asset_by_id_returns_metadata(vector_store):
@@ -109,8 +124,7 @@ def test_get_asset_by_id_returns_none_for_missing(vector_store):
     assert get_asset_by_id(vector_store, "SRV-99999") is None
 
 
-def test_update_asset_metadata_persists_and_reflected_after_cache_clear(vector_store):
-    # Use SRV-003 (low-criticality internal app) to avoid altering critical sample data.
+def test_update_asset_metadata_persists_and_reflected_after_reopen(vector_store, tmp_path):
     original = get_asset_by_id(vector_store, "SRV-003")
     assert original is not None
     original_desc = original.get("description", "")
@@ -123,70 +137,54 @@ def test_update_asset_metadata_persists_and_reflected_after_cache_clear(vector_s
     fetched = get_asset_by_id(vector_store, "SRV-003")
     assert fetched["description"] == new_desc
 
-    # list_all_assets / cached loader should also see it after clearing cache.
-    load_all_assets_metadata.clear()
-    all_assets = {a["asset_id"]: a for a in list_all_assets(vector_store)}
+    # A separately opened wrapper must see the persisted update too.
+    all_assets = {a["asset_id"]: a for a in list_all_assets(reopen_store(tmp_path))}
     assert all_assets["SRV-003"]["description"] == new_desc
 
-    # Restore original value.
-    update_asset_metadata(vector_store, "SRV-003", {"description": original_desc})
-    load_all_assets_metadata.clear()
 
-
-def test_software_inventory_persists_in_chroma(vector_store):
-    original = get_asset_by_id(vector_store, "SRV-003")
-    original_sw = original.get(SOFTWARE_INVENTORY_FIELD, "")
-
+def test_software_inventory_persists_in_chroma(vector_store, tmp_path):
     software = [
         {"name": "TestApp", "version": "1.0.0", "cpe": "cpe:2.3:a:testvendor:testapp:1.0.0:*:*:*:*:*:*:*"},
     ]
     updates = {SOFTWARE_INVENTORY_FIELD: save_software_inventory(software)}
     assert update_asset_metadata(vector_store, "SRV-003", updates)
 
-    fetched = get_asset_by_id(vector_store, "SRV-003")
+    fetched = get_asset_by_id(reopen_store(tmp_path), "SRV-003")
     loaded = load_software_inventory(fetched)
     assert len(loaded) == 1
     assert loaded[0]["cpe"] == "cpe:2.3:a:testvendor:testapp:1.0.0:*:*:*:*:*:*:*"
 
-    # Restore.
-    update_asset_metadata(vector_store, "SRV-003", {SOFTWARE_INVENTORY_FIELD: original_sw})
-    load_all_assets_metadata.clear()
 
-
-def test_collect_asset_cpes_from_live_asset_with_inventory(vector_store):
-    # Set inventory on SRV-003, collect CPEs, then restore.
-    original = get_asset_by_id(vector_store, "SRV-003")
-    original_sw = original.get(SOFTWARE_INVENTORY_FIELD, "")
-
+def test_collect_asset_cpes_from_temporary_asset_with_inventory(vector_store):
     software = [
         {"name": "TestApp", "version": "1.0.0", "cpe": "cpe:2.3:a:testvendor:testapp:1.0.0:*:*:*:*:*:*:*"},
     ]
-    update_asset_metadata(vector_store, "SRV-003", {SOFTWARE_INVENTORY_FIELD: save_software_inventory(software)})
+    assert update_asset_metadata(vector_store, "SRV-003", {SOFTWARE_INVENTORY_FIELD: save_software_inventory(software)})
 
     fetched = get_asset_by_id(vector_store, "SRV-003")
     cpes = collect_asset_cpes(fetched)
     assert "cpe:2.3:a:testvendor:testapp:1.0.0:*:*:*:*:*:*:*" in cpes
 
-    # Restore.
-    update_asset_metadata(vector_store, "SRV-003", {SOFTWARE_INVENTORY_FIELD: original_sw})
-    load_all_assets_metadata.clear()
-
 
 # ---------------------------------------------------------------------------
 # Legacy collection preservation
 # ---------------------------------------------------------------------------
-def test_legacy_corporate_assets_collection_untouched(vector_store):
-    from ingest_assets import COLLECTION_NAME
-    from langchain_chroma import Chroma
-    from langchain_huggingface import HuggingFaceEmbeddings
-    from ingest_assets import CHROMA_PERSIST_DIR, EMBEDDING_MODEL_NAME
-
+def test_legacy_corporate_assets_collection_untouched(tmp_path):
     legacy = Chroma(
         collection_name=COLLECTION_NAME,
-        persist_directory=CHROMA_PERSIST_DIR,
-        embedding_function=HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME),
+        persist_directory=str(tmp_path),
+        embedding_function=DummyEmbeddings(),
     )
-    ids = set(legacy.get()["ids"])
-    # Legacy collection should still contain its original assets and not v2 IDs.
-    assert "asset:SRV-001" not in ids
-    assert len(ids) > 0
+    legacy.add_texts(["Legacy fixture asset"], metadatas=[{"asset_id": "LEGACY-001"}], ids=["legacy:001"])
+    before = legacy.get(include=["metadatas", "documents", "embeddings"])
+    current = ingest_v2_to_chromadb(
+        csv_file=str(Path(__file__).resolve().parents[1] / "data" / "asset_data_v2.csv"),
+        persist_directory=str(tmp_path), collection_name=COLLECTION_NAME_V2,
+        embeddings=DummyEmbeddings(),
+    )
+    assert update_asset_metadata(current, "SRV-003", {"description": "Temporary test update"})
+    after = reopen_store(tmp_path, COLLECTION_NAME).get(include=["metadatas", "documents", "embeddings"])
+    assert after["ids"] == before["ids"] == ["legacy:001"]
+    assert after["documents"] == before["documents"]
+    assert after["metadatas"] == before["metadatas"]
+    assert (after["embeddings"] == before["embeddings"]).all()

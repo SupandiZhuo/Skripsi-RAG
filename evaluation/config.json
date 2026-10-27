@@ -1,0 +1,14 @@
+{
+  "experiments": ["E0"],
+  "model": "gemini-2.5-flash",
+  "embedding_model": "all-MiniLM-L6-v2",
+  "top_k": 3,
+  "relevance_threshold": 0.15,
+  "temperature": 0,
+  "seed": 0,
+  "repeats": 1,
+  "prompt_version": "source-hash-recorded",
+  "rubric_version": "source-hash-recorded",
+  "threshold_status": "heuristic_not_validation_selected",
+  "scope": "infrastructure_not_empirical_research"
+}

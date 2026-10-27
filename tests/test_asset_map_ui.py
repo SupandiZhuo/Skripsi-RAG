@@ -13,17 +13,13 @@ def test_active_app_has_no_cytoscape_or_asset_graph_dependency():
         for node in imports
         for alias in (node.names if isinstance(node, ast.Import) else [None])
     }
-    html_calls = [
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "st"
-        and node.func.attr == "html"
-    ]
-
-    assert "asset_graph" not in imported_modules
+    retired_graph_modules = {"asset_graph", "cytoscape", "streamlit_cytoscape", "pyvis"}
+    assert not any(
+        module and module.split(".")[0] in retired_graph_modules
+        for module in imported_modules
+    )
     assert "render_cytoscape_html" not in source
-    assert len(html_calls) == 1
-    assert isinstance(html_calls[0].args[0], ast.Name)
-    assert html_calls[0].args[0].id == "DARK_MODE_STYLES"
+    assert "cytoscape(" not in source.lower()
+    # CSS and escaped result cards are allowed; executable embeds are not.
+    assert "<script" not in source.lower()
+    assert "components.html" not in source

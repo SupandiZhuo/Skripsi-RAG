@@ -75,16 +75,16 @@ def test_version_start_inclusive():
     ])))
     assert determine_applicability("cpe:2.3:a:apache:log4j:2.0.0:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.CONFIRMED
     assert determine_applicability("cpe:2.3:a:apache:log4j:2.17.0:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.CONFIRMED
-    assert determine_applicability("cpe:2.3:a:apache:log4j:1.9.9:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.NOT_APPLICABLE
+    assert determine_applicability("cpe:2.3:a:apache:log4j:1.9.9:*:*:*:*:*:*:*", cfg, inventory_verified=True).status == ApplicabilityStatus.NOT_APPLICABLE
 
 
 def test_version_start_exclusive_and_end_exclusive():
     cfg = _configs(_config(_node(matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:*:*:*:*:*:*:*:*", versionStartExcluding="2.0.0", versionEndExcluding="2.17.0"),
     ])))
-    assert determine_applicability("cpe:2.3:a:apache:log4j:2.0.0:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.NOT_APPLICABLE
+    assert determine_applicability("cpe:2.3:a:apache:log4j:2.0.0:*:*:*:*:*:*:*", cfg, inventory_verified=True).status == ApplicabilityStatus.NOT_APPLICABLE
     assert determine_applicability("cpe:2.3:a:apache:log4j:2.0.1:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.CONFIRMED
-    assert determine_applicability("cpe:2.3:a:apache:log4j:2.17.0:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.NOT_APPLICABLE
+    assert determine_applicability("cpe:2.3:a:apache:log4j:2.17.0:*:*:*:*:*:*:*", cfg, inventory_verified=True).status == ApplicabilityStatus.NOT_APPLICABLE
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +104,7 @@ def test_and_requires_all_conditions():
     assert determine_applicability(
         ["cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*", "cpe:2.3:o:linux:linux_kernel:5.0:*:*:*:*:*:*:*"],
         cfg,
+        inventory_verified=True,
     ).status == ApplicabilityStatus.NOT_APPLICABLE
 
 
@@ -113,7 +114,7 @@ def test_or_any_condition():
         _cpe_match("cpe:2.3:a:apache:log4j:2.15.0:*:*:*:*:*:*:*"),
     ])))
     assert determine_applicability("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.CONFIRMED
-    assert determine_applicability("cpe:2.3:a:apache:log4j:2.16.0:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.NOT_APPLICABLE
+    assert determine_applicability("cpe:2.3:a:apache:log4j:2.16.0:*:*:*:*:*:*:*", cfg, inventory_verified=True).status == ApplicabilityStatus.NOT_APPLICABLE
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +138,7 @@ def test_nested_children_or_inside_and():
     assert determine_applicability(
         ["cpe:2.3:a:apache:log4j:2.15.0:*:*:*:*:*:*:*", "cpe:2.3:o:linux:linux_kernel:5.0:*:*:*:*:*:*:*"],
         cfg,
+        inventory_verified=True,
     ).status == ApplicabilityStatus.NOT_APPLICABLE
 
 
@@ -155,26 +157,26 @@ def test_vulnerable_false_does_not_override_vulnerable_true_in_or():
 
 def test_vulnerable_false_contextualizes_within_and():
     # AND: vulnerable:true range, vulnerable:false for 2.17.0.
-    # 2.17.0 should be Not Applicable because the AND is broken by the negation.
+    # vulnerable:false is a supporting condition, NOT a Boolean negation.
     cfg = _configs(_config(_node(operator="AND", matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:*:*:*:*:*:*:*:*", versionStartIncluding="2.0.0", versionEndIncluding="2.17.0"),
         _cpe_match("cpe:2.3:a:apache:log4j:2.17.0:*:*:*:*:*:*:*", vulnerable=False),
     ])))
-    assert determine_applicability("cpe:2.3:a:apache:log4j:2.17.0:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.NOT_APPLICABLE
+    assert determine_applicability("cpe:2.3:a:apache:log4j:2.17.0:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.CONFIRMED
 
 
-def test_vulnerable_false_alone_marks_not_applicable():
+def test_vulnerable_false_alone_does_not_establish_vulnerable_target():
     cfg = _configs(_config(_node(matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:2.17.0:*:*:*:*:*:*:*", vulnerable=False),
     ])))
-    assert determine_applicability("cpe:2.3:a:apache:log4j:2.17.0:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.NOT_APPLICABLE
+    assert determine_applicability("cpe:2.3:a:apache:log4j:2.17.0:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.UNKNOWN
 
 
 def test_node_negate():
     cfg = _configs(_config(_node(operator="OR", negate=True, matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*"),
     ])))
-    assert determine_applicability("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.NOT_APPLICABLE
+    assert determine_applicability("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*", cfg, inventory_verified=True).status == ApplicabilityStatus.NOT_APPLICABLE
 
 
 # ---------------------------------------------------------------------------
@@ -242,21 +244,21 @@ def test_different_product_is_not_applicable():
     cfg = _configs(_config(_node(matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*"),
     ])))
-    assert determine_applicability("cpe:2.3:a:microsoft:windows:10:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.NOT_APPLICABLE
+    assert determine_applicability("cpe:2.3:a:microsoft:windows:10:*:*:*:*:*:*:*", cfg, inventory_verified=True).status == ApplicabilityStatus.NOT_APPLICABLE
 
 
 def test_different_vendor_same_product_is_not_applicable():
     cfg = _configs(_config(_node(matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*"),
     ])))
-    assert determine_applicability("cpe:2.3:a:other:log4j:2.14.1:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.NOT_APPLICABLE
+    assert determine_applicability("cpe:2.3:a:other:log4j:2.14.1:*:*:*:*:*:*:*", cfg, inventory_verified=True).status == ApplicabilityStatus.NOT_APPLICABLE
 
 
 def test_version_outside_range_is_not_applicable():
     cfg = _configs(_config(_node(matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:*:*:*:*:*:*:*:*", versionStartIncluding="2.0.0", versionEndExcluding="2.17.0"),
     ])))
-    assert determine_applicability("cpe:2.3:a:apache:log4j:2.17.0:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.NOT_APPLICABLE
+    assert determine_applicability("cpe:2.3:a:apache:log4j:2.17.0:*:*:*:*:*:*:*", cfg, inventory_verified=True).status == ApplicabilityStatus.NOT_APPLICABLE
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +302,7 @@ def test_explicit_non_match_distinguished_from_unknown():
     cfg = _configs(_config(_node(matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:*:*:*:*:*:*:*:*", versionStartIncluding="2.0.0", versionEndIncluding="2.17.0"),
     ])))
-    result = determine_applicability("cpe:2.3:a:apache:log4j:9.9.9:*:*:*:*:*:*:*", cfg)
+    result = determine_applicability("cpe:2.3:a:apache:log4j:9.9.9:*:*:*:*:*:*:*", cfg, inventory_verified=True)
     assert result.status == ApplicabilityStatus.NOT_APPLICABLE
     assert any(ev.get("reason") == "version_explicitly_outside_range" for ev in result.evidence)
 
@@ -321,7 +323,7 @@ def test_and_with_false_and_unknown_returns_false():
         _cpe_match("cpe:2.3:a:apache:http_server:2.4.51:*:*:*:*:*:*:*"),
         {"vulnerable": True, "criteria": "not-a-cpe", "matchCriteriaId": "mc-bad"},
     ])))
-    assert determine_applicability("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.NOT_APPLICABLE
+    assert determine_applicability("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*", cfg, inventory_verified=True).status == ApplicabilityStatus.NOT_APPLICABLE
 
 
 def test_and_with_true_and_unknown_returns_unknown():

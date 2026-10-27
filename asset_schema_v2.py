@@ -14,6 +14,8 @@ import sys
 from datetime import date
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from asset_inventory import is_valid_cpe
+
 SCHEMA_VERSION = "2.0"
 UNKNOWN = "unknown"
 
@@ -45,6 +47,10 @@ V2_COLUMNS: List[str] = [
     "is_synthetic",
     "schema_version",
 ]
+
+# Runtime extensions may be appended in this order without changing existing
+# dataset headers. Loading never infers completeness from a primary CPE.
+V2_EXTENSION_COLUMNS = ("software_inventory_json", "inventory_verified")
 
 # Required fields must be present and non-empty (v1 columns + structural v2).
 REQUIRED_FIELDS: List[str] = [
@@ -141,6 +147,13 @@ def validate_row(
                 f"allowed values are {_format_allowed(allowed)}"
             )
 
+    flag = row.get("inventory_verified", "")
+    if type(flag) is not bool and (not isinstance(flag, str) or flag not in ("", "unknown", "true", "false")):
+        errors.append(f"{prefix}: field 'inventory_verified' must be true, false, unknown, or empty")
+    cpe = row.get("cpe", "")
+    if cpe not in (None, "", "unknown") and not is_valid_cpe(cpe):
+        errors.append(f"{prefix}: field 'cpe' must be a complete CPE 2.3 formatted string, unknown, or empty")
+
     last_updated = str(row.get("last_updated", "")).strip()
     if last_updated:
         try:
@@ -168,7 +181,8 @@ def validate_row(
 def validate_csv(path: str) -> List[str]:
     """Validate a Schema v2 CSV file. Returns all errors (empty list = valid).
 
-    Checks the header against V2_COLUMNS (exact set and order), structural
+    Checks V2_COLUMNS plus optional appended extensions in declared order,
+    structural
     row width, per-row field rules, and asset_id uniqueness (CM-8 style
     identity - a duplicate id would silently collide as RAG evidence).
     """
@@ -181,9 +195,10 @@ def validate_csv(path: str) -> List[str]:
             except StopIteration:
                 return [f"{path}: file is empty (no header row)"]
 
-            if header != V2_COLUMNS:
+            expected_header = V2_COLUMNS + [field for field in V2_EXTENSION_COLUMNS if field in header]
+            if header != expected_header:
                 missing = [c for c in V2_COLUMNS if c not in header]
-                extra = [c for c in header if c not in V2_COLUMNS]
+                extra = [c for c in header if c not in V2_COLUMNS and c not in V2_EXTENSION_COLUMNS]
                 if missing:
                     errors.append(
                         f"{path}: header is missing column(s): "
@@ -197,7 +212,7 @@ def validate_csv(path: str) -> List[str]:
                 if not missing and not extra:
                     errors.append(
                         f"{path}: header columns out of order; expected "
-                        f"{', '.join(V2_COLUMNS)}"
+                        f"{', '.join(expected_header)}"
                     )
 
             seen_ids: Dict[str, int] = {}

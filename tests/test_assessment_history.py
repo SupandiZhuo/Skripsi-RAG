@@ -8,6 +8,7 @@ Run: python -m pytest test_assessment_history.py -q
 import json
 import os
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -79,6 +80,34 @@ def test_record_from_analysis_assigns_unique_id():
     )
     assert record.id is not None
     assert len(record.id) > 0
+
+
+def test_investigation_and_provenance_survive_history_round_trip(tmp_path):
+    result = SimpleNamespace(
+        status="needs_verification", score=80,
+        investigation_priority="P1", rubric_version="research-test",
+        explanation="Verify installed software before remediation ranking.",
+        missing_evidence=(), unknown_factors=(), rule_contributions=(),
+    )
+    record = record_from_analysis(
+        cve_id="CVE-2021-44228", asset_metadata={"asset_id": "A"},
+        base_score=9.8, context_score=9.8, priority=None,
+        llm_priority="P1", vector_string="base", modified_vector="env",
+        retrieval_confidence=None, applicability="Unknown",
+        priority_result=result,
+        model_output={"confidentiality_requirement": "H"},
+        provenance={"vector_origin": "nvd", "model_input": {"asset_id": "A"}},
+    )
+    path = str(tmp_path / "history.json")
+    save_assessment(record, path)
+    loaded = load_history(path)[0]
+    assert loaded.priority is None
+    assert loaded.investigation_priority == "P1"
+    assert loaded.priority_status == "needs_verification"
+    assert loaded.rubric_version == "research-test"
+    assert loaded.model_output == {"confidentiality_requirement": "H"}
+    assert loaded.provenance is not None
+    assert loaded.provenance["model_input"] == {"asset_id": "A"}
 
 
 def test_delete_record_removes_one_entry():

@@ -1,39 +1,19 @@
-"""Hardened CVE applicability matching using NVD CPE configurations (Phase A.1).
+"""Conservative NVD applicability, not a complete CPE reference implementation.
 
-Determines whether a CVE is applicable to an organizational asset by evaluating
-NVD CPE configurations with three-valued logic (True / False / Unknown) while
-preserving AND/OR/negate structure and version-range semantics.
+Supports full CPE 2.3 formatted strings with escaping and eleven attributes;
+CPE URI binding (cpe:/...) is unsupported. Version ordering supports canonical
+dotted integers only, with zero-padding (1.2 == 1.2.0); identical concrete vendor
+versions match without ordering. Unsupported ordering returns Unknown.
 
-Result states (unchanged from Phase A):
-- Confirmed      — the asset is in the set of affected configurations.
-- Not Applicable — the asset is explicitly outside the affected set.
-- Unknown        — insufficient or unparseable information to decide.
+Conditions and positive vulnerable targets are separate through AND/OR trees.
+Supporting vulnerable:false entries can satisfy conditions but cannot establish
+a target. Negation never creates positive target evidence. Multi-node containers
+without explicit operators are Unknown; single-node containers need no default.
 
-Design decisions:
-- Version-range qualifiers (versionStartIncluding, versionStartExcluding,
-  versionEndIncluding, versionEndExcluding) are evaluated against the asset's
-  declared CPE version using a dotted-numeric comparator. Non-numeric or
-  otherwise unparseable versions fall back to Unknown.
-- Each `cpeMatch` is evaluated as a three-valued condition. A match that is
-  `vulnerable: true` yields True; a match that is `vulnerable: false` yields
-  False. An asset whose vendor/product overlap with the criteria but whose
-  version is explicitly outside the criteria's affected range also yields False.
-- Nodes are combined according to their `operator` (AND / OR) and `negate`
-  flag using three-valued Kleene logic.
-- Multiple installed CPEs are supported: pass a list or a comma/semicolon/newline
-  separated string in the asset CPE field.
-- `vulnerable: false` is treated as a contextual condition, not as automatic
-  proof that the asset is unaffected. It participates in the same Boolean
-  structure as `vulnerable: true` matches.
-- Traceable evidence records the configuration path, criteria, range
-  conditions, the matched asset CPE, and the reason for the condition value.
-
-Limitations (documented):
-- CPE 2.3 URI parsing only; CPE 2.2 is treated as opaque and cannot be matched.
-- Dotted-numeric version comparison handles common schemes (1.2.3). Mixed
-  alphanumeric versions (e.g., "2.14a", "stable") return Unknown.
-- NVD configurations with deeply unusual logic may still yield Unknown when the
-  evaluator cannot decide reliably.
+Missing inventory is open-world. Absent products prove exclusion only when
+inventory_verified is explicitly True. Neither a primary CPE nor a nonempty
+software list automatically attests completeness. Evidence includes leaf
+condition_match/is_vulnerable_component and tree combination outcomes.
 """
 
 import re
@@ -68,45 +48,90 @@ def _normalize_cpes(asset_cpes: Union[None, str, Iterable[str]]) -> List[str]:
     if isinstance(asset_cpes, str):
         if _is_blank_cpe(asset_cpes):
             return []
-        parts = re.split(r"[,;\n]+", asset_cpes)
-        return [p.strip() for p in parts if p.strip() and not _is_blank_cpe(p.strip())]
-    return [
-        str(c).strip()
-        for c in asset_cpes
-        if str(c).strip() and not _is_blank_cpe(str(c).strip())
-    ]
+        parts, current, escaped = [], [], False
+        for char in asset_cpes:
+            if char in ",;\n" and not escaped:
+                parts.append("".join(current))
+                current = []
+            else:
+                current.append(char)
+            escaped = char == "\\" and not escaped
+        parts.append("".join(current))
+        return [p.strip() for p in parts if p.strip()]
+    if not isinstance(asset_cpes, Iterable) or isinstance(asset_cpes, Mapping):
+        return ["invalid_inventory"]
+    # Do not discard invalid/unknown members of an otherwise valid inventory:
+    # doing so could turn a verified non-match into an unsupported exclusion.
+    return [str(c).strip() for c in asset_cpes]
+
+
+CPE_FIELDS = ("part", "vendor", "product", "version", "update", "edition",
+              "language", "sw_edition", "target_sw", "target_hw", "other")
+RANGE_FIELDS = ("versionStartIncluding", "versionStartExcluding",
+                "versionEndIncluding", "versionEndExcluding")
+
+
+def _component_tokens(value: str) -> Optional[List[Tuple[str, bool]]]:
+    tokens = []
+    i = 0
+    while i < len(value):
+        char = value[i]
+        if char == "\\":
+            i += 1
+            if i == len(value) or value[i].isalnum() or value[i] in "_." or not (33 <= ord(value[i]) <= 126):
+                return None
+            tokens.append((value[i], True))
+        elif char.isascii() and (char.isalnum() or char in "_.-*?"):
+            tokens.append((char, False))
+        else:
+            return None
+        i += 1
+    return tokens or None
+
+
+def _valid_component(value: str) -> bool:
+    if value in ("*", "-"):
+        return True
+    tokens = _component_tokens(value)
+    if not tokens:
+        return False
+    shape = "".join(char if not quoted and char in "*?" else "x" for char, quoted in tokens)
+    return re.fullmatch(r"(?:\*|\?+)?x+(?:\*|\?+)?|\?+", shape) is not None
 
 
 def parse_cpe(cpe_uri: str) -> Optional[Dict[str, str]]:
-    """Parse a CPE 2.3 URI into its component parts.
+    """Validate CPE 2.3 formatted strings and retain all escaped attributes.
 
-    Format: cpe:2.3:<part>:<vendor>:<product>:<version>:<update>:<edition>:...
+    Literal punctuation, ANY (*), and NA (-) remain distinct. URI binding
+    (cpe:/...) is intentionally unsupported.
     """
-    if not cpe_uri or not cpe_uri.startswith("cpe:2.3:"):
+    if not isinstance(cpe_uri, str) or not cpe_uri.startswith("cpe:2.3:"):
         return None
-    parts = cpe_uri.split(":")
-    if len(parts) < 6:
+    parts, current, escaped = [], [], False
+    for char in cpe_uri[8:]:
+        if char == ":" and not escaped:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+        escaped = char == "\\" and not escaped
+    parts.append("".join(current))
+    if len(parts) != 11 or any(not _valid_component(part) for part in parts):
         return None
-    return {
-        "part": parts[2],
-        "vendor": parts[3],
-        "product": parts[4],
-        "version": parts[5] if len(parts) > 5 else "*",
-        "update": parts[6] if len(parts) > 6 else "*",
-        "edition": parts[7] if len(parts) > 7 else "*",
-    }
+    if parts[0] not in ("a", "h", "o", "*", "-"):
+        return None
+    if parts[6] not in ("*", "-") and re.fullmatch(r"[A-Za-z]{2,3}(?:-(?:[A-Za-z]{2}|[0-9]{3}))?", parts[6]) is None:
+        return None
+    return dict(zip(CPE_FIELDS, parts))
 
 
 def _parse_version(version: str) -> Optional[List[int]]:
     """Parse a dotted-numeric version. Return None for unsupported schemes."""
-    if not version or version == "*" or version == "-":
+    if not isinstance(version, str) or len(version) > 256 or re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))*", version) is None:
         return None
     parts = version.split(".")
     numeric = []
     for part in parts:
-        part = part.lstrip("vV")
-        if not re.fullmatch(r"\d+", part):
-            return None
         numeric.append(int(part))
     return numeric
 
@@ -133,46 +158,51 @@ def _version_in_range(version: str, match: Mapping[str, Any]) -> Optional[bool]:
 
     Returns True/False or None when a boundary cannot be evaluated.
     """
-    lower: Optional[bool] = None
-    if "versionStartIncluding" in match:
-        cmp = _compare_versions(version, match["versionStartIncluding"])
-        if cmp is None:
-            return None
-        lower = cmp >= 0
-    elif "versionStartExcluding" in match:
-        cmp = _compare_versions(version, match["versionStartExcluding"])
-        if cmp is None:
-            return None
-        lower = cmp > 0
-
-    upper: Optional[bool] = None
-    if "versionEndIncluding" in match:
-        cmp = _compare_versions(version, match["versionEndIncluding"])
-        if cmp is None:
-            return None
-        upper = cmp <= 0
-    elif "versionEndExcluding" in match:
-        cmp = _compare_versions(version, match["versionEndExcluding"])
-        if cmp is None:
-            return None
-        upper = cmp < 0
-
-    if lower is False or upper is False:
-        return False
-    if lower is None and upper is None:
+    if ("versionStartIncluding" in match and "versionStartExcluding" in match) or (
+        "versionEndIncluding" in match and "versionEndExcluding" in match
+    ):
         return None
-    if lower is None:
-        return upper
-    if upper is None:
-        return lower
-    return lower and upper
+    start = next((key for key in RANGE_FIELDS[:2] if key in match), None)
+    end = next((key for key in RANGE_FIELDS[2:] if key in match), None)
+    if start and end:
+        ordering = _compare_versions(match[start], match[end])
+        if ordering is None or ordering > 0 or (ordering == 0 and (start.endswith("Excluding") or end.endswith("Excluding"))):
+            return None
+    values = []
+    for key in RANGE_FIELDS:
+        if key not in match:
+            continue
+        ordering = _compare_versions(version, match[key])
+        if ordering is None:
+            return None
+        values.append({"versionStartIncluding": ordering >= 0,
+                       "versionStartExcluding": ordering > 0,
+                       "versionEndIncluding": ordering <= 0,
+                       "versionEndExcluding": ordering < 0}[key])
+    return all(values) if values else None
+
+
+def _component_match(asset_value: str, criteria_value: str) -> Optional[bool]:
+    if criteria_value == "*":
+        return True
+    if asset_value == "*":
+        return None
+    if criteria_value == "-" or asset_value == "-":
+        return criteria_value == asset_value
+    asset_tokens = _component_tokens(asset_value)
+    criteria_tokens = _component_tokens(criteria_value)
+    if asset_tokens is None or criteria_tokens is None:
+        return None
+    if any(char in "*?" and not quoted for char, quoted in asset_tokens):
+        return None
+    pattern = "".join(".*" if char == "*" and not quoted else "." if char == "?" and not quoted else re.escape(char)
+                      for char, quoted in criteria_tokens)
+    literal = "".join(char for char, _ in asset_tokens)
+    return re.fullmatch(pattern, literal, re.IGNORECASE) is not None
 
 
 def _cpe_component_matches(asset_value: str, criteria_value: str) -> bool:
-    crit = criteria_value.strip()
-    if crit == "*" or crit == "-":
-        return True
-    return crit.lower() == asset_value.strip().lower()
+    return _component_match(asset_value, criteria_value) is True
 
 
 def _build_evidence(
@@ -181,16 +211,18 @@ def _build_evidence(
     criteria: str,
     match: Mapping[str, Any],
     *,
-    matched: bool,
+    matched: Optional[bool],
     reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     ev: Dict[str, Any] = {
         "path": path,
         "asset_cpe": asset_cpe,
         "criteria": criteria,
-        "vulnerable": bool(match.get("vulnerable", True)),
+        "vulnerable": match.get("vulnerable"),
+        "is_vulnerable_component": match.get("vulnerable") is True,
         "matchCriteriaId": match.get("matchCriteriaId"),
         "matched": matched,
+        "condition_match": matched,
         "reason": reason,
     }
     ranges = {k: match[k] for k in (
@@ -228,10 +260,14 @@ def _kleene_not(value: Optional[bool]) -> Optional[bool]:
 
 
 def _kleene_combine(values: List[Optional[bool]], operator: str) -> Optional[bool]:
-    op = (operator or "OR").upper()
+    if not values or not isinstance(operator, str):
+        return None
+    op = operator.upper()
     if op == "AND":
         return _kleene_and(values)
-    return _kleene_or(values)
+    if op == "OR":
+        return _kleene_or(values)
+    return None
 
 
 # Match evaluation ------------------------------------------------------------
@@ -251,19 +287,23 @@ def _evaluate_match_for_asset(
     if asset is None:
         return (
             None,
-            _build_evidence(path, asset_cpe, criteria_cpe, match, matched=False, reason="asset_cpe_unparseable"),
+            _build_evidence(path, asset_cpe, criteria_cpe, match, matched=None, reason="asset_cpe_unparseable"),
         )
     if criteria is None:
         return (
             None,
-            _build_evidence(path, asset_cpe, criteria_cpe, match, matched=False, reason="criteria_unparseable"),
+            _build_evidence(path, asset_cpe, criteria_cpe, match, matched=None, reason="criteria_unparseable"),
         )
 
-    # Vendor/product relevance check.
-    for key in ("part", "vendor", "product", "update", "edition"):
-        if not _cpe_component_matches(asset.get(key, "*"), criteria.get(key, "*")):
-            # Different product family: this condition is False for this asset.
-            return False, None
+    if any(asset[key] in ("*", "-") or any(
+        char in "*?" and not quoted for char, quoted in _component_tokens(asset[key]) or []
+    ) for key in ("part", "vendor", "product")):
+        return None, _build_evidence(path, asset_cpe, criteria_cpe, match, matched=None, reason="asset_identity_incomplete")
+
+    attributes = [_component_match(asset[key], criteria[key]) for key in CPE_FIELDS if key != "version"]
+    attribute_result = _kleene_and(attributes)
+    if attribute_result is False:
+        return False, _build_evidence(path, asset_cpe, criteria_cpe, match, matched=False, reason="attribute_mismatch")
 
     version = asset.get("version", "*")
     crit_version = criteria.get("version", "*")
@@ -272,31 +312,43 @@ def _evaluate_match_for_asset(
         "versionEndIncluding", "versionEndExcluding",
     ))
 
+    # Exact identifiers do not require vendor-specific version ordering. For
+    # differing numeric representations preserve the existing dotted comparator.
+    if crit_version == "*":
+        exact_result = True
+    elif version == "*":
+        exact_result = None
+    elif any(char in "*?" and not quoted for char, quoted in _component_tokens(version) or []):
+        exact_result = None
+    elif crit_version == "-" or version == "-":
+        exact_result = version == crit_version
+    elif asset["version"].lower() == criteria["version"].lower():
+        exact_result = True
+    elif any(char in "*?" and not quoted for char, quoted in _component_tokens(crit_version) or []):
+        exact_result = _component_match(version, crit_version)
+    else:
+        cmp = _compare_versions(version, crit_version)
+        exact_result = None if cmp is None else cmp == 0
+
     if has_range:
         range_result = _version_in_range(version, match)
         if range_result is None:
             return (
                 None,
-                _build_evidence(path, asset_cpe, criteria_cpe, match, matched=False, reason="version_range_unsupported"),
+                _build_evidence(path, asset_cpe, criteria_cpe, match, matched=None, reason="version_range_unsupported"),
             )
-        version_match = range_result
-    elif crit_version == "*" or crit_version == "-":
-        version_match = True
+        version_match = _kleene_and([exact_result, range_result])
     else:
-        cmp = _compare_versions(version, crit_version)
-        if cmp is None:
-            return (
-                None,
-                _build_evidence(path, asset_cpe, criteria_cpe, match, matched=False, reason="version_compare_unsupported"),
-            )
-        version_match = cmp == 0
+        version_match = exact_result
 
-    if version_match:
-        vulnerable = bool(match.get("vulnerable", True))
+    condition = _kleene_and([attribute_result, version_match])
+    if condition is True:
         return (
-            vulnerable,
+            True,
             _build_evidence(path, asset_cpe, criteria_cpe, match, matched=True),
         )
+    if condition is None:
+        return None, _build_evidence(path, asset_cpe, criteria_cpe, match, matched=None, reason="attribute_or_version_unknown")
 
     # Explicit non-match: same product, version outside affected set.
     return (
@@ -309,6 +361,7 @@ def _evaluate_match_against_assets(
     match: Mapping[str, Any],
     asset_cpes: Sequence[str],
     path: str,
+    inventory_verified: bool = False,
 ) -> Tuple[Optional[bool], List[Dict[str, Any]]]:
     """Evaluate one cpeMatch entry against all installed asset CPEs (OR).
 
@@ -318,6 +371,8 @@ def _evaluate_match_against_assets(
     has_true = False
     has_unknown = False
     evidence: List[Dict[str, Any]] = []
+    if not isinstance(match, Mapping) or type(match.get("vulnerable")) is not bool:
+        return None, [{"path": path, "condition_match": None, "reason": "invalid_match_metadata"}]
     for asset_cpe in asset_cpes:
         res, ev = _evaluate_match_for_asset(asset_cpe, match, path)
         if ev is not None:
@@ -331,64 +386,105 @@ def _evaluate_match_against_assets(
         return True, evidence
     if has_unknown:
         return None, evidence
-    # No asset matched and none were indeterminate -> condition is False.
+    if not inventory_verified:
+        evidence.append({"path": path, "criteria": match.get("criteria"), "matched": None,
+                         "condition_match": None, "reason": "inventory_not_verified"})
+        return None, evidence
     return False, evidence
 
 
 # Node / configuration evaluation ---------------------------------------------
+@dataclass
+class _Condition:
+    matched: Optional[bool]
+    affected: Optional[bool]
+    evidence: List[Dict[str, Any]]
+
+
+def _unknown_condition(path: str, reason: str) -> _Condition:
+    return _Condition(None, None, [{"path": path, "condition_match": None, "reason": reason}])
+
+
+def _combine_conditions(results: List[_Condition], operator: Any, negate: Any, path: str) -> _Condition:
+    evidence = [entry for result in results for entry in result.evidence]
+    # No arbitrary AND/OR default for ambiguous containers. Native single-node
+    # configurations work without an operator because there is no combination.
+    if operator is None and len(results) == 1:
+        operator = "OR"
+    if not results or operator not in ("AND", "OR") or type(negate) is not bool:
+        unknown = _unknown_condition(path, "unsupported_or_ambiguous_configuration")
+        unknown.evidence = evidence + unknown.evidence
+        return unknown
+    matched = _kleene_combine([result.matched for result in results], operator)
+    if operator == "AND":
+        affected = _kleene_and([matched, _kleene_or([result.affected for result in results])])
+    else:
+        # Child witnesses already include their own AND guards. A vulnerable
+        # leaf in an unsatisfied OR branch must never leak into a supporting one.
+        affected = _kleene_or([result.affected for result in results])
+    if negate:
+        matched = _kleene_not(matched)
+        affected = False  # Negation cannot manufacture a positive target.
+    evidence.append({"path": path, "operator": operator, "negate": negate,
+                     "condition_match": matched, "vulnerable_target_match": affected,
+                     "reason": "combined_configuration"})
+    return _Condition(matched, affected, evidence)
+
+
 def _evaluate_node(
     node: Mapping[str, Any],
     asset_cpes: Sequence[str],
     path: str,
-) -> Tuple[Optional[bool], List[Dict[str, Any]]]:
-    """Evaluate an NVD configuration node recursively.
-
-    Returns (result, evidence).
-    """
-    results: List[Optional[bool]] = []
-    evidence: List[Dict[str, Any]] = []
-
-    for idx, match in enumerate(node.get("cpeMatch", [])):
+    inventory_verified: bool = False,
+    depth: int = 0,
+) -> _Condition:
+    if not isinstance(node, Mapping) or depth > 32:
+        return _unknown_condition(path, "invalid_node_or_depth_limit")
+    matches, children = node.get("cpeMatch", []), node.get("children", [])
+    if not isinstance(matches, list) or not isinstance(children, list) or "nodes" in node:
+        return _unknown_condition(path, "invalid_node_children")
+    results = []
+    for idx, match in enumerate(matches):
         subpath = f"{path}.cpeMatch[{idx}]"
-        res, ev = _evaluate_match_against_assets(match, asset_cpes, subpath)
-        evidence.extend(ev)
-        results.append(res)
-
-    for idx, child in enumerate(node.get("children", [])):
-        subpath = f"{path}.children[{idx}]"
-        res, ev = _evaluate_node(child, asset_cpes, subpath)
-        evidence.extend(ev)
-        results.append(res)
-
-    if not results:
-        return None, evidence
-
-    combined = _kleene_combine(results, node.get("operator", "OR"))
-    if node.get("negate"):
-        combined = _kleene_not(combined)
-    return combined, evidence
+        condition, evidence = _evaluate_match_against_assets(match, asset_cpes, subpath, inventory_verified)
+        vulnerable = match.get("vulnerable") if isinstance(match, Mapping) else None
+        affected = condition if vulnerable is True else False if vulnerable is False else None
+        results.append(_Condition(condition, affected, evidence))
+    for idx, child in enumerate(children):
+        results.append(_evaluate_node(child, asset_cpes, f"{path}.children[{idx}]", inventory_verified, depth + 1))
+    return _combine_conditions(results, node.get("operator"), node.get("negate", False), path)
 
 
-def _normalize_configs(nvd_configurations: Optional[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
-    if not nvd_configurations:
-        return []
-    if "configurations" in nvd_configurations:
-        configs = nvd_configurations["configurations"]
-        return list(configs) if isinstance(configs, Sequence) and not isinstance(configs, str) else []
-    # Backward compatibility: a raw node container passed directly.
-    return [{"nodes": nvd_configurations.get("nodes", [])}]
+def _normalize_configs(nvd_configurations: Any) -> List[Any]:
+    """Native NVD arrays, wrapped arrays, or legacy direct node containers.
+
+    Preserve malformed entries as Unknown branches instead of dropping them.
+    """
+    if isinstance(nvd_configurations, list):
+        return nvd_configurations
+    if isinstance(nvd_configurations, Mapping):
+        if "configurations" in nvd_configurations:
+            value = nvd_configurations["configurations"]
+            return value if isinstance(value, list) else [None]
+        if "nodes" in nvd_configurations:
+            return [nvd_configurations]
+    return []
 
 
 def determine_applicability(
     asset_cpes: Union[None, str, Iterable[str]],
-    nvd_configurations: Optional[Mapping[str, Any]],
+    nvd_configurations: Any,
+    inventory_verified: bool = False,
 ) -> ApplicabilityResult:
     """Determine CVE applicability to an asset from NVD CPE data.
 
     Args:
         asset_cpes: Asset CPE string(s). A single string may contain multiple
             CPEs separated by comma, semicolon, or newline.
-        nvd_configurations: NVD CVE `configurations` object.
+        nvd_configurations: Native NVD configurations list, wrapped list, or
+            legacy direct configuration container.
+        inventory_verified: Explicit boolean attestation that installed-product
+            inventory is complete. Defaults False: absent products remain Unknown.
 
     Returns:
         ApplicabilityResult with status, traceable evidence, and explanation.
@@ -409,68 +505,40 @@ def determine_applicability(
             explanation="NVD has no CPE configuration data for this CVE.",
         )
 
-    config_results: List[Optional[bool]] = []
+    config_results: List[_Condition] = []
     all_evidence: List[Dict[str, Any]] = []
 
     for cfg_idx, config in enumerate(configs):
         cfg_path = f"configurations[{cfg_idx}]"
-        nodes = config.get("nodes", [])
-        node_results: List[Optional[bool]] = []
-        node_evidence: List[Dict[str, Any]] = []
+        if not isinstance(config, Mapping) or not isinstance(config.get("nodes"), list):
+            result = _unknown_condition(cfg_path, "invalid_configuration")
+        else:
+            nodes = [_evaluate_node(node, cpe_list, f"{cfg_path}.nodes[{idx}]", inventory_verified is True)
+                     for idx, node in enumerate(config["nodes"])]
+            result = _combine_conditions(nodes, config.get("operator"), config.get("negate", False), cfg_path)
+        config_results.append(result)
+        all_evidence.extend(result.evidence)
 
-        for node_idx, node in enumerate(nodes):
-            node_path = f"{cfg_path}.nodes[{node_idx}]"
-            res, ev = _evaluate_node(node, cpe_list, node_path)
-            node_evidence.extend(ev)
-            node_results.append(res)
+    overall = _kleene_or([result.matched for result in config_results])
+    affected = _kleene_or([result.affected for result in config_results])
 
-        all_evidence.extend(node_evidence)
-        if node_results:
-            # Multiple nodes within one configuration are ANDed.
-            # Unknown (None) results participate in Kleene logic so that
-            # e.g. True AND Unknown -> Unknown, not True.
-            config_results.append(_kleene_and(node_results))
-
-    if not config_results:
-        # No node produced a determinable result (e.g., all unparseable).
-        has_evidence = any(
-            e.get("reason") in (
-                "asset_cpe_unparseable", "criteria_unparseable",
-                "version_range_unsupported", "version_compare_unsupported",
-            )
-            for e in all_evidence
-        )
-        if has_evidence:
-            return ApplicabilityResult(
-                status=ApplicabilityStatus.UNKNOWN,
-                evidence=all_evidence,
-                explanation="Asset CPE(s) overlap the CVE configuration but could not be evaluated reliably.",
-            )
-        return ApplicabilityResult(
-            status=ApplicabilityStatus.NOT_APPLICABLE,
-            evidence=all_evidence,
-            explanation="No NVD CPE criteria matched the asset's declared product family; the CVE is not applicable.",
-        )
-
-    overall = _kleene_or(config_results)
-
-    if overall is True:
+    if overall is True and affected is True:
         return ApplicabilityResult(
             status=ApplicabilityStatus.CONFIRMED,
             evidence=all_evidence,
             explanation="Asset CPE(s) match vulnerable configuration criteria in NVD.",
         )
-    if overall is False:
+    if overall is False and inventory_verified is True:
         return ApplicabilityResult(
             status=ApplicabilityStatus.NOT_APPLICABLE,
             evidence=all_evidence,
-            explanation="Asset CPE(s) are explicitly outside the affected configuration set or match only non-vulnerable/negated criteria.",
+            explanation="Verified complete asset inventory is outside all evaluated NVD configurations.",
         )
 
     return ApplicabilityResult(
         status=ApplicabilityStatus.UNKNOWN,
         evidence=all_evidence,
-        explanation="Applicability could not be determined from the available NVD CPE data.",
+        explanation="Applicability is unresolved: inventory, configuration semantics, or positive vulnerable-target evidence is insufficient.",
     )
 
 
@@ -484,7 +552,7 @@ def cpe_matches(asset_cpe: str, criteria_cpe: str) -> bool:
     criteria = parse_cpe(criteria_cpe)
     if asset is None or criteria is None:
         return False
-    for key in ("part", "vendor", "product", "version", "update", "edition"):
+    for key in CPE_FIELDS:
         if not _cpe_component_matches(asset.get(key, "*"), criteria.get(key, "*")):
             return False
     return True

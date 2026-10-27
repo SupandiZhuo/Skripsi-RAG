@@ -1,4 +1,12 @@
-"""Deterministic organizational remediation-priority rubric (Phase 2C).
+"""LEGACY / BASELINE ONLY — Phase 2C priority rubric (inactive).
+
+The active application policy is organizational_priority.py, documented in
+docs/PRIORITY_RUBRIC.md. This historical implementation is retained solely
+for baseline comparisons and compatibility; its weights/thresholds and
+missing-evidence gates MUST NOT be described as the active algorithm.
+The policy below describes the legacy baseline only.
+
+Deterministic organizational remediation-priority rubric (Phase 2C).
 
 Computes Organizational Priority (P1-P4) from verified evidence only:
 - Organizational asset context (Asset Schema v2 fields retrieved via RAG).
@@ -22,7 +30,7 @@ Responsibility boundary (do not blur):
   preserved unchanged as a model suggestion; this module is the deterministic
   counterpart used for reproducible/defensible results and later evaluation.
 
-Rubric (max 100 points; weights justified in docs/PRIORITY_RUBRIC.md):
+Legacy rubric (max 100 points; not the active documented policy):
 
   Factor                  Points                              Kind
   ----------------------  ----------------------------------  --------

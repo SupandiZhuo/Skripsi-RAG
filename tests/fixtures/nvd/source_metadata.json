@@ -1,0 +1,67 @@
+[
+  {
+    "cve_id": "CVE-2021-44228",
+    "source_url": "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-2021-44228",
+    "retrieved_at": "2026-10-27T01:08:57.276866+00:00",
+    "sha256": "6ca4a68f32a75976fcc3b27ddf81c1b0d7fc60c45d0f075b21ffd24c6192d7ce",
+    "file": "CVE-2021-44228.json",
+    "metric_families": [
+      "cvssMetricV2",
+      "cvssMetricV31",
+      "ssvcV203"
+    ],
+    "configuration_count": 20,
+    "origin": "Genuine unmodified NVD API response; not a research label"
+  },
+  {
+    "cve_id": "CVE-2023-44487",
+    "source_url": "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-2023-44487",
+    "retrieved_at": "2026-10-27T01:09:04.580246+00:00",
+    "sha256": "79bd56607017c22961d33fdb7e5a1c7781134673c268ce5fd09b3f5af1ba7898",
+    "file": "CVE-2023-44487.json",
+    "metric_families": [
+      "cvssMetricV31",
+      "ssvcV203"
+    ],
+    "configuration_count": 44,
+    "origin": "Genuine unmodified NVD API response; not a research label"
+  },
+  {
+    "cve_id": "CVE-2024-3094",
+    "source_url": "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-2024-3094",
+    "retrieved_at": "2026-10-27T01:09:11.475385+00:00",
+    "sha256": "81f1e4ac7178c30e236f0f90f10b0c5ccbf5397c49cc717ab72e909559ca1932",
+    "file": "CVE-2024-3094.json",
+    "metric_families": [
+      "cvssMetricV31",
+      "ssvcV203"
+    ],
+    "configuration_count": 1,
+    "origin": "Genuine unmodified NVD API response; not a research label"
+  },
+  {
+    "cve_id": "CVE-1999-0095",
+    "source_url": "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-1999-0095",
+    "retrieved_at": "2026-10-27T01:09:18.243674+00:00",
+    "sha256": "7daa7d25c73871dc3ed8ef3e95b00685a3369d0c28ddf04bf3b785f6ffaec538",
+    "file": "CVE-1999-0095.json",
+    "metric_families": [
+      "cvssMetricV2"
+    ],
+    "configuration_count": 1,
+    "origin": "Genuine unmodified NVD API response; not a research label"
+  },
+  {
+    "cve_id": "CVE-2026-99999",
+    "source_url": "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-2026-99999",
+    "retrieved_at": "2026-10-27T01:09:25.160828+00:00",
+    "sha256": "ea0fe6154e0d53373f64c6bc59881c0c6f6cb1d002539b844178d836c9d5143b",
+    "file": "CVE-2026-99999.json",
+    "metric_families": [
+      "cvssMetricV31",
+      "ssvcV203"
+    ],
+    "configuration_count": 0,
+    "origin": "Genuine unmodified NVD API response; not a research label"
+  }
+]

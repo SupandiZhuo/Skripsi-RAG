@@ -48,6 +48,10 @@ class AssessmentRecord:
     priority_unknown_factors: Optional[List[str]] = None
     priority_contributions: Optional[List[Dict[str, Any]]] = None
     graph_dependencies: Optional[Dict[str, Any]] = None
+    investigation_priority: Optional[str] = None
+    rubric_version: Optional[str] = None
+    model_output: Optional[Dict[str, Any]] = None
+    provenance: Optional[Dict[str, Any]] = None
 
 
 def _utc_now_iso() -> str:
@@ -99,6 +103,8 @@ def record_from_analysis(
     applicability_evidence: Optional[List[Dict[str, Any]]] = None,
     priority_result: Optional[Any] = None,
     graph_dependencies: Optional[Mapping[str, Any]] = None,
+    model_output: Optional[Mapping[str, Any]] = None,
+    provenance: Optional[Mapping[str, Any]] = None,
 ) -> AssessmentRecord:
     return AssessmentRecord(
         id=str(uuid.uuid4()),
@@ -131,6 +137,10 @@ def record_from_analysis(
             "evidence_source": c.evidence_source,
         } for c in (priority_result.rule_contributions if priority_result else ())],
         graph_dependencies=dict(graph_dependencies) if graph_dependencies else None,
+        investigation_priority=getattr(priority_result, "investigation_priority", None),
+        rubric_version=getattr(priority_result, "rubric_version", None),
+        model_output=dict(model_output) if model_output else None,
+        provenance=dict(provenance) if provenance else None,
     )
 
 

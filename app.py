@@ -1,6 +1,10 @@
-from collections import Counter
+from dataclasses import asdict
+from datetime import date
+from html import escape
+import json
+import re
+import pandas as pd
 import streamlit as st
-import requests
 from cvss import CVSS3
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -11,15 +15,18 @@ from rag_retrieval import (
     filtered_metadata,
     get_asset_by_id,
     list_all_assets,
-    retrieve_asset_context,
+    retrieve_document_context,
     update_asset_metadata,
 )
-from llm_assessment import ContextualAssessment, LlmAssessmentError, analyze_with_llm
+from llm_assessment import DEFAULT_MODEL, LlmAssessmentError, analyze_with_llm, build_model_context
+from nvd_client import fetch_cve_from_nvd
+from cvss_engine import build_environmental_vector, validate_base_vector
 from organizational_priority import calculate_organizational_priority
-from cve_applicability import ApplicabilityStatus, determine_applicability
+from cve_applicability import determine_applicability
 from asset_inventory import (
     SOFTWARE_INVENTORY_FIELD,
     collect_asset_cpes,
+    inventory_is_verified,
     is_valid_cpe,
     load_software_inventory,
     save_software_inventory,
@@ -30,11 +37,12 @@ from assessment_history import (
     record_from_analysis,
     save_assessment,
 )
-from asset_schema_v2 import ALLOWED_VALUES
+from asset_schema_v2 import ALLOWED_VALUES, SCHEMA_VERSION, V2_COLUMNS, validate_row
 from ingest_assets import (
     CHROMA_PERSIST_DIR,
     COLLECTION_NAME_V2,
     EMBEDDING_MODEL_NAME,
+    build_v2_document,
 )
 
 st.set_page_config(
@@ -45,48 +53,126 @@ st.set_page_config(
 )
 
 PAGE_OPTIONS = [
-    "Dashboard",
-    "Asset Inventory",
     "Vulnerability Analysis",
+    "Asset Inventory",
     "Analysis History",
 ]
 
-DARK_MODE_STYLES = """
+# Native light/dark colors are controlled by .streamlit/config.toml.
+# Keep this CSS layout-only; never override native Streamlit widget colors.
+APP_LAYOUT_STYLES = """
 <style>
-:root { color-scheme: dark; }
-.stApp,
-[data-testid="stAppViewContainer"],
-[data-testid="stMain"] {
-    background-color: #0d1117;
-    color: #e6edf3;
+/* A compact local research tool: small navigation, generous content width. */
+[data-testid="stSidebar"] { min-width: 0; }
+[data-testid="stSidebar"][data-collapsed="false"] { width: 240px !important; max-width: 240px; }
+[data-testid="stSidebar"][data-collapsed="true"] {
+    width: 0 !important; min-width: 0 !important; max-width: 0 !important;
+    flex-basis: 0 !important; border: 0; overflow: hidden;
 }
-[data-testid="stHeader"] { background-color: #0d1117; }
-[data-testid="stSidebar"],
-[data-testid="stSidebar"] > div {
-    background-color: #161b22;
+/* Keep the title close to the top; the native sidebar header still holds its collapse control. */
+[data-testid="stSidebarUserContent"] { padding: 0 0 .5rem; }
+[data-testid="stSidebarHeader"] { height: 2.25rem; min-height: 2.25rem; }
+[data-testid="stLogoSpacer"] { height: 1.25rem; }
+[data-testid="stSidebar"] h1 { font-size: 1.3rem; }
+[data-testid="stSidebar"] [role="radiogroup"] { gap: .3rem; }
+[data-testid="stSidebar"] [role="radiogroup"] label {
+    display: flex; width: 100%; min-height: 42px; box-sizing: border-box;
+    align-items: center; padding: .5rem .75rem; border-radius: 7px; margin: 0;
+    color: inherit;
 }
-.stApp h1, .stApp h2, .stApp h3, .stApp h4,
-.stApp p, .stApp label, .stApp li, .stApp [data-testid="stCaptionContainer"] {
-    color: #e6edf3;
+[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {
+    background-color: color-mix(in srgb, #2563eb 17%, transparent);
+    color: inherit;
 }
-.stApp [data-testid="stVerticalBlockBorderWrapper"],
-.stApp [data-testid="stMetric"],
-.stApp [data-testid="stForm"],
-.stApp [data-testid="stExpander"] details {
-    background-color: #161b22;
-    border-color: #30363d;
+[data-testid="stSidebar"] [role="radiogroup"] label > div:first-child { display:none; }
+[data-testid="stSidebar"] [data-testid="stRadioOption"] [data-testid="stMarkdownContainer"] p {
+    color: inherit;
 }
-.stApp input, .stApp textarea,
-.stApp [data-baseweb="select"] > div {
-    background-color: #0d1117 !important;
-    color: #e6edf3 !important;
+[data-testid="stSidebarUserContent"] > div > [data-testid="stVerticalBlock"] {
+    min-height: calc(100dvh - 3rem);
 }
-.stApp pre, .stApp code {
-    background-color: #161b22;
-    color: #e6edf3;
+[data-testid="stSidebar"] [data-testid="stLayoutWrapper"]:has(> .st-key-sidebar_settings) {
+    margin-top: auto;
 }
-.stApp [data-testid="stDataFrame"],
-.stApp [data-testid="stDataEditor"] { color-scheme: dark; }
+.st-key-sidebar_settings { padding-top: 1.5rem; }
+.st-key-sidebar_settings [data-testid="stExpander"] details {
+    background: transparent; border: 0; box-shadow: none;
+}
+.st-key-sidebar_settings summary { min-height: 42px; padding: .5rem .75rem; }
+.st-key-nav_page,
+.st-key-nav_page [data-testid="stRadio"],
+.st-key-nav_page [role="radiogroup"],
+.st-key-nav_page [role="radiogroup"] > div {
+    width: 100%; align-self: stretch;
+}
+[data-testid="stSidebar"] [data-testid="stRadioOption"] > div { width: 100%; min-width: 0; }
+[data-testid="stSidebar"] [data-testid="stRadioOption"] > div > div:first-child { display:none; }
+[data-testid="stSidebar"] [data-testid="stRadioOption"] [data-testid="stMarkdownContainer"] {
+    display: flex; width: 100%; min-width: 0; align-items: center; gap: .65rem;
+}
+[data-testid="stSidebar"] [data-testid="stRadioOption"] [data-testid="stMarkdownContainer"] p {
+    margin: 0; line-height: 1.3; white-space: nowrap;
+}
+[data-testid="stSidebar"] [data-testid="stRadioOption"] [data-testid="stMarkdownContainer"]::before {
+    font-family: 'Material Symbols Rounded'; font-size: 20px;
+    line-height: 1; width: 20px; flex-shrink: 0; text-align: center;
+}
+[data-testid="stSidebar"] [data-testid="stRadioGroup"] > div:nth-child(1) [data-testid="stMarkdownContainer"]::before { content: 'search'; }
+[data-testid="stSidebar"] [data-testid="stRadioGroup"] > div:nth-child(2) [data-testid="stMarkdownContainer"]::before { content: 'database'; }
+[data-testid="stSidebar"] [data-testid="stRadioGroup"] > div:nth-child(3) [data-testid="stMarkdownContainer"]::before { content: 'history'; }
+/* Streamlit 1.66+ calculates top clearance from theme.paddingTop,
+   including the native three-dot toolbar. Do not set a competing CSS padding-top. */
+[data-testid="stMainBlockContainer"] {
+    width: 100%; max-width: none; margin-inline: 0;
+    padding-left: clamp(1.25rem, 2.5vw, 3rem);
+    padding-right: clamp(1.25rem, 2.5vw, 3rem);
+}
+[data-testid="stForm"] { padding: 1.2rem; }
+/* Custom result blocks use transparent, inherited colors in both themes. */
+.result-card {
+    border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+    border-radius: 8px; padding: 18px; min-height: 160px;
+    background: transparent; color: inherit;
+}
+.result-card > strong { font-size: 1.45rem; }
+.result-card.priority { background: color-mix(in srgb, #d73a49 7%, transparent); }
+.result-card.priority-p2 { background: color-mix(in srgb, #e87916 7%, transparent); }
+.result-card.priority-p3 { background: color-mix(in srgb, #d4a72c 8%, transparent); }
+.result-card.priority-p4 { background: color-mix(in srgb, #2563eb 7%, transparent); }
+.result-card.priority strong { font-size: 1.65rem; }
+.result-card .card-label { font-size: .85rem; margin-bottom: 7px; }
+.result-card .score { font-size: 2rem; line-height: 1.25; font-weight: 700; }
+.result-card .card-note { font-size: .78rem; opacity: .76; margin-top: 8px; }
+.requirement-card { min-height: 92px; }
+.requirement-card strong {
+    display: inline-block; margin-top: 9px; border-radius: 5px;
+    padding: 3px 10px; font-size: .95rem;
+}
+.requirement-high strong, .severity-critical, .severity-high { background: #fee2e2; color: #991b1b; }
+.requirement-medium strong, .severity-medium { background: #fef3c7; color: #92400e; }
+.requirement-low strong, .severity-low { background: #dcfce7; color: #166534; }
+.severity-badge {
+    display: inline-block; border-radius: 4px; padding: 2px 8px;
+    font-size: .8rem; background: color-mix(in srgb, currentColor 9%, transparent);
+}
+.summary-card {
+    border: 1px solid color-mix(in srgb, #2563eb 26%, transparent);
+    border-radius: 8px; padding: 18px;
+    background: color-mix(in srgb, #2563eb 7%, transparent);
+    color: inherit; margin: 10px 0;
+}
+.summary-card p { color: inherit; white-space: pre-wrap; font-size: .93rem; line-height: 1.7; margin-bottom: 0; }
+.db-status { font-size: .85rem; padding: .7rem 0; }
+.db-ready { color: #16a34a; }
+.db-error { color: #ef4444; }
+@media (max-width: 640px) {
+    [data-testid="stMainBlockContainer"] {
+        padding-left: 1rem;
+        padding-right: 1rem;
+    }
+    /* Keep touch-friendly native sidebar controls on small screens. */
+    [data-testid="stSidebarHeader"] { height: 3rem; min-height: 3rem; }
+}
 </style>
 """
 
@@ -101,12 +187,26 @@ def load_vector_db():
         collection_name=COLLECTION_NAME_V2,
         persist_directory=CHROMA_PERSIST_DIR,
         embedding_function=embeddings,
+        create_collection_if_not_exists=False,
+    )
+
+
+@st.cache_resource
+def load_context_db():
+    """Document evidence lives separately from stable asset inventory records."""
+    return Chroma(
+        collection_name="organizational_context",
+        collection_metadata={"hnsw:space": "cosine"},
+        persist_directory=CHROMA_PERSIST_DIR,
+        embedding_function=HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME),
+        create_collection_if_not_exists=False,
     )
 
 
 try:
     vector_store = load_vector_db()
-    db_status = "Ready"
+    inventory_count = len(vector_store.get(include=["metadatas"]).get("ids") or [])
+    db_status = "Ready" if inventory_count else "Empty inventory"
 except Exception as e:
     vector_store = None
     db_status = f"Error: {e}"
@@ -127,14 +227,10 @@ def _init_session_state():
     st.session_state.setdefault("inventory_selected_asset_id", "")
     st.session_state.setdefault("analysis_result", None)
     st.session_state.setdefault("analysis_record", None)
-    st.session_state.setdefault("dark_mode", False)
 
 
 _init_session_state()
 
-
-def _toggle_dark_mode():
-    st.session_state.dark_mode = not st.session_state.dark_mode
 
 # Handle cross-page navigation triggered by buttons rendered later in the app.
 # We use a query parameter because Streamlit disallows modifying a widget's
@@ -145,60 +241,12 @@ if _nav_target:
         st.session_state.nav_page = _nav_target
     del st.query_params["nav"]
 if st.session_state.get("nav_page") not in PAGE_OPTIONS:
-    st.session_state.nav_page = "Dashboard"
+    st.session_state.nav_page = "Vulnerability Analysis"
 
 
 # ---------------------------------------------------------------------------
 # 3. SHARED HELPERS
 # ---------------------------------------------------------------------------
-def fetch_cve_from_nvd(cve_id):
-    url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}"
-    try:
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        if not data.get("vulnerabilities"):
-            return None, "CVE tidak ditemukan."
-
-        cve_data = data["vulnerabilities"][0]["cve"]
-        descriptions = cve_data.get("descriptions", [])
-        desc = next((d["value"] for d in descriptions if d["lang"] == "en"), "Description not provided by NVD.")
-
-        metrics = cve_data.get("metrics", {})
-        cvss_metrics = metrics.get("cvssMetricV31") or metrics.get("cvssMetricV30") or []
-        cvss_v3 = cvss_metrics[0].get("cvssData", {}) if cvss_metrics else {}
-
-        return {
-            "cve_id": cve_id,
-            "description": desc,
-            "base_score": cvss_v3.get("baseScore"),
-            "vector_string": cvss_v3.get("vectorString", ""),
-            "configurations": cve_data.get("configurations", {}),
-        }, "Sukses"
-    except Exception as e:
-        return None, str(e)
-
-
-def build_environmental_vector(original_vector, assessment: ContextualAssessment):
-    """Deterministic Environmental vector construction.
-
-    Appends the model-assessed CR/IR/AR onto the preserved NVD Base vector.
-    Base metrics are NEVER modified, and MAV is left undefined (X).
-    """
-    if not original_vector or not original_vector.strip().startswith("CVSS:3."):
-        raise ValueError("Base Vector NVD tidak valid.")
-    CVSS3(original_vector.strip())
-
-    parts = original_vector.strip().split("/")
-    base_parts = [p for p in parts if not p.startswith(("CR:", "IR:", "AR:", "MAV:"))]
-
-    cr = assessment.confidentiality_requirement.value
-    ir = assessment.integrity_requirement.value
-    ar = assessment.availability_requirement.value
-
-    return "/".join(base_parts) + f"/CR:{cr}/IR:{ir}/AR:{ar}"
-
-
 def _asset_label(asset: dict) -> str:
     asset_id = asset.get("asset_id", "?")
     name = asset.get("asset_name", asset_id)
@@ -222,110 +270,26 @@ with st.sidebar:
         key="nav_page",
         label_visibility="collapsed",
     )
-    st.button(
-        "Switch to light mode" if st.session_state.dark_mode else "Switch to dark mode",
-        icon=":material/light_mode:" if st.session_state.dark_mode else ":material/dark_mode:",
-        key="theme_toggle",
-        on_click=_toggle_dark_mode,
-    )
+    with st.container(key="sidebar_settings"):
+        with st.expander(":material/settings: Settings", expanded=False):
+            api_key = st.text_input("Gemini API Key", type="password", key="gemini_api_key")
+            model_name = st.text_input("Gemini model", value=DEFAULT_MODEL, key="gemini_model")
+            confidence_threshold = st.slider(
+                "Retrieval relevance threshold", min_value=0.0, max_value=1.0,
+                value=DEFAULT_CONFIDENCE_THRESHOLD, step=0.05,
+                help="Only relevant documents for the selected asset may enter model context.",
+            )
+            st.caption("Light / Dark theme: use the ⋮ menu at the top right.")
+            st.caption(f"Inventory collection: {COLLECTION_NAME_V2}")
+        status_class = "db-ready" if db_status == "Ready" else "db-error"
+        st.html(f'<div class="db-status {status_class}">● ChromaDB {escape(db_status)}</div>')
 
-    st.divider()
-    st.header(":material/settings: Configuration")
-    api_key = st.text_input(
-        "Gemini API Key",
-        type="password",
-        help="Dapatkan dari Google AI Studio",
-    )
-    confidence_threshold = st.slider(
-        "Retrieval confidence threshold",
-        min_value=0.0,
-        max_value=1.0,
-        value=DEFAULT_CONFIDENCE_THRESHOLD,
-        step=0.05,
-        help="Normalized relevance score. Low-confidence semantic candidates are flagged; the selected stable asset ID remains the context source.",
-    )
-
-    st.metric(label="ChromaDB status", value=db_status)
-    if db_status == "Ready":
-        st.success(f"Collection '{COLLECTION_NAME_V2}' active.")
-    else:
-        st.error("Run `python ingest_assets.py --v2` first.")
-
-if st.session_state.dark_mode:
-    st.html(DARK_MODE_STYLES)
+st.html(APP_LAYOUT_STYLES)
 
 
 # ---------------------------------------------------------------------------
 # 5. PAGE RENDERERS
 # ---------------------------------------------------------------------------
-def _render_dashboard():
-    st.header(":material/dashboard: Dashboard")
-
-    assets = load_all_assets_metadata()
-    history = load_history()
-    with st.container(horizontal=True):
-        st.metric("Total assets", len(assets), border=True)
-        st.metric("Completed assessments", len(history), border=True)
-
-    severity_counts = Counter()
-    priority_counts = Counter()
-    for record in history:
-        score = record.context_score if record.context_score is not None else record.base_score
-        if score is not None:
-            if score >= 9.0:
-                severity_counts["Critical"] += 1
-            elif score >= 7.0:
-                severity_counts["High"] += 1
-            elif score >= 4.0:
-                severity_counts["Medium"] += 1
-            elif score > 0:
-                severity_counts["Low"] += 1
-        if record.priority in {"P1", "P2", "P3", "P4"}:
-            priority_counts[record.priority] += 1
-
-    col1, col2 = st.columns(2)
-    with col1:
-        with st.container(border=True):
-            st.subheader("Severity distribution")
-            if severity_counts:
-                st.bar_chart(dict(severity_counts))
-            else:
-                st.info("No completed assessments with a CVSS score.")
-
-    with col2:
-        with st.container(border=True):
-            st.subheader("Priority distribution")
-            if priority_counts:
-                st.bar_chart(dict(priority_counts))
-            else:
-                st.info("No completed assessments with a deterministic priority.")
-
-    with st.container(border=True):
-        st.subheader("Recent assessments")
-        if history:
-            recent = history[-5:][::-1]
-            st.dataframe(
-                [
-                    {
-                        "Time": r.timestamp[:19].replace("T", " "),
-                        "CVE": r.cve_id,
-                        "Asset": r.asset_name or r.asset_id,
-                        "Base": r.base_score,
-                        "Context": r.context_score,
-                        "Priority": r.priority,
-                    }
-                    for r in recent
-                ],
-                hide_index=True,
-            )
-        else:
-            st.info("No assessments recorded yet. Run an analysis from Vulnerability Analysis.")
-
-    with st.container(horizontal=True):
-        if st.button("Run Vulnerability Analysis", icon=":material/biotech:"):
-            _navigate_to("Vulnerability Analysis")
-
-
 def _render_asset_detail(assets: list[dict]):
     """Right-hand asset detail editor for the Asset Inventory page."""
     selected_id = st.session_state.inventory_selected_asset_id
@@ -410,6 +374,8 @@ def _render_asset_detail(assets: list[dict]):
                 "software_version": e_sw_version,
                 "cpe": e_cpe,
             }
+            if e_cpe != asset.get("cpe", ""):
+                updates["inventory_verified"] = "false"
             if e_cpe and not is_valid_cpe(e_cpe):
                 st.error(f"Primary CPE is not a valid CPE 2.3 URI: {e_cpe}")
             elif not vector_store:
@@ -448,6 +414,11 @@ def _render_asset_detail(assets: list[dict]):
             hide_index=True,
             key=f"sw_editor_{selected_id}",
         )
+        verified_inventory = st.checkbox(
+            "I verified this is the complete installed-product inventory for this asset.",
+            value=inventory_is_verified(asset), key=f"sw_verified_{selected_id}",
+            help="Without explicit completeness verification, an absent product remains Unknown rather than Not Applicable.",
+        )
 
         if st.button("Save software inventory", icon=":material/save:", key=f"sw_save_{selected_id}"):
             cleaned = []
@@ -459,6 +430,8 @@ def _render_asset_detail(assets: list[dict]):
                     continue
                 if cpe and not is_valid_cpe(cpe):
                     errors.append(f"Row {idx + 1}: invalid CPE '{cpe}'")
+                if verified_inventory and not is_valid_cpe(cpe):
+                    errors.append(f"Row {idx + 1}: complete verified inventory requires a valid CPE for each software record.")
                 cleaned.append({
                     "name": name,
                     "version": str(row.get("version") or "").strip(),
@@ -470,7 +443,8 @@ def _render_asset_detail(assets: list[dict]):
             elif not vector_store:
                 st.error("ChromaDB is not ready; cannot save changes.")
             else:
-                updates = {SOFTWARE_INVENTORY_FIELD: save_software_inventory(cleaned)}
+                updates = {SOFTWARE_INVENTORY_FIELD: save_software_inventory(cleaned),
+                           "inventory_verified": "true" if verified_inventory else "false"}
                 if update_asset_metadata(vector_store, selected_id, updates):
                     load_all_assets_metadata.clear()
                     st.success("Software inventory saved.")
@@ -482,23 +456,85 @@ def _render_asset_detail(assets: list[dict]):
         if st.button("Analyze vulnerability", icon=":material/biotech:", key=f"analyze_detail_{selected_id}", type="primary"):
             st.session_state.analysis_asset_id = selected_id
             st.session_state.analysis_asset_preselect = selected_id
+            st.session_state.analysis_result = None
+            st.session_state.analysis_record = None
             _navigate_to("Vulnerability Analysis")
 
 
+def _render_add_asset():
+    """Create only after an explicit submit; never overwrite an existing ID."""
+    with st.form("add_asset_form"):
+        st.subheader("New asset")
+        row = {field: "unknown" for field in V2_COLUMNS}
+        row.update(schema_version=SCHEMA_VERSION, software_name="", software_version="", cpe="")
+        left, right = st.columns(2)
+        for column, fields in (
+            (left, ("asset_id", "asset_name", "ip_address", "description", "source", "source_reference")),
+            (right, ("owner", "business_function")),
+        ):
+            for field in fields:
+                row[field] = column.text_input(field.replace("_", " ").title(), key=f"new_{field}")
+        row["last_updated"] = str(st.date_input("Last updated", value=date.today(), key="new_updated"))
+        for field in (
+            "asset_type", "business_criticality", "data_sensitivity", "environment",
+            "network_zone", "internet_exposed", "confidentiality_requirement",
+            "integrity_requirement", "availability_requirement", "is_synthetic",
+        ):
+            row[field] = st.selectbox(field.replace("_", " ").title(),
+                                      ALLOWED_VALUES[field], key=f"new_{field}")
+        submitted = st.form_submit_button("Create asset", type="primary")
+    if not submitted:
+        return
+    errors = validate_row(row)
+    if row["asset_id"] != row["asset_id"].strip():
+        errors.append("Asset ID must not contain surrounding whitespace.")
+    if not vector_store:
+        errors.append("ChromaDB is not ready.")
+    elif get_asset_by_id(vector_store, row["asset_id"]):
+        errors.append("Asset ID already exists. Use the editor instead; existing records are never overwritten here.")
+    if errors:
+        for error in errors:
+            st.error(error)
+        return
+    try:
+        document = build_v2_document(row)
+        # Chroma collection.add, unlike upsert/add_documents, rejects duplicate IDs.
+        vector_store._collection.add(ids=[f"asset:{row['asset_id']}"],
+                                     documents=[document.page_content], metadatas=[document.metadata],
+                                     embeddings=vector_store.embeddings.embed_documents([document.page_content]))
+        stored = get_asset_by_id(vector_store, row["asset_id"])
+        if not stored or stored.get("asset_name") != row["asset_name"]:
+            st.error("Asset write could not be verified. Refresh inventory before retrying.")
+            return
+        load_all_assets_metadata.clear()
+        st.session_state.show_add_asset = False
+        st.session_state.inventory_selected_asset_id = row["asset_id"]
+        st.rerun()
+    except Exception as exc:
+        st.error(f"Asset creation failed: {exc}")
+
+
 def _render_asset_inventory():
-    st.header(":material/table_chart: Asset Inventory")
+    with st.container(horizontal=True, vertical_alignment="center", gap="medium", key="inventory_header"):
+        st.header(":material/database: Asset Inventory")
+        if st.button("Add Asset", icon=":material/add:", type="primary", key="add_asset"):
+            st.session_state.show_add_asset = not st.session_state.get("show_add_asset", False)
+    st.caption("View and manage asset metadata used for contextual analysis.")
+    if st.session_state.get("show_add_asset"):
+        _render_add_asset()
 
     assets = load_all_assets_metadata()
     if not assets:
         st.info("No assets found. Run `python ingest_assets.py --v2` to populate the knowledge base.")
         return
 
-    f1, f2, f3, f4, f5 = st.columns([2, 1, 1, 1, 1])
-    search = f1.text_input("Search assets", placeholder="Name / ID / IP", key="inv_search")
-    type_filter = f2.multiselect("Asset type", options=sorted({a.get("asset_type", "unknown") for a in assets}), key="inv_type")
-    crit_filter = f3.multiselect("Business criticality", options=sorted({a.get("business_criticality", "unknown") for a in assets}), key="inv_crit")
-    exposure_filter = f4.multiselect("Internet exposure", options=sorted({a.get("internet_exposed", "unknown") for a in assets}), key="inv_exp")
-    zone_filter = f5.multiselect("Network zone", options=sorted({a.get("network_zone", "unknown") for a in assets}), key="inv_zone")
+    search = st.text_input("Search assets", placeholder="Search by name, ID, or IP…", key="inv_search", label_visibility="collapsed")
+    with st.expander("Inventory filters"):
+        f1, f2, f3, f4 = st.columns(4)
+        type_filter = f1.multiselect("Asset type", options=sorted({a.get("asset_type", "unknown") for a in assets}), key="inv_type")
+        crit_filter = f2.multiselect("Business criticality", options=sorted({a.get("business_criticality", "unknown") for a in assets}), key="inv_crit")
+        exposure_filter = f3.multiselect("Internet exposure", options=sorted({a.get("internet_exposed", "unknown") for a in assets}), key="inv_exp")
+        zone_filter = f4.multiselect("Network zone", options=sorted({a.get("network_zone", "unknown") for a in assets}), key="inv_zone")
 
     filtered = assets
     if search:
@@ -539,10 +575,9 @@ def _render_asset_inventory():
             "Business Criticality": asset.get("business_criticality", "unknown"),
             "Internet Exposure": asset.get("internet_exposed", "unknown"),
             "Software/CPE Summary": software_summary,
-            "View/Edit Action": "Select below",
-            "Analyze Vulnerability Action": "Select below",
         })
-    st.dataframe(table_rows, hide_index=True)
+    table = pd.DataFrame(table_rows, columns=["Asset ID", "Asset Name", "Asset Type", "Business Criticality", "Internet Exposure", "Software/CPE Summary"])
+    st.dataframe(table, hide_index=True, width="stretch")
 
     filtered_ids = [str(a.get("asset_id") or "") for a in filtered if a.get("asset_id")]
     if not filtered_ids:
@@ -567,13 +602,126 @@ def _render_asset_inventory():
     if selected_id and st.button("Analyze selected asset", icon=":material/biotech:", type="primary", key="inventory_analyze_action"):
         st.session_state.analysis_asset_id = selected_id
         st.session_state.analysis_asset_preselect = selected_id
+        st.session_state.analysis_result = None
+        st.session_state.analysis_record = None
         _navigate_to("Vulnerability Analysis")
 
     _render_asset_detail(assets)
 
 
+def _new_analysis():
+    st.session_state.analysis_result = None
+    st.session_state.analysis_record = None
+    st.session_state.analysis_saved = False
+    st.session_state.cloud_consent = False
+
+
+def _render_analysis_result():
+    """Render exclusively from session state so reruns never erase the results."""
+    result = st.session_state.analysis_result
+    asset = result["asset_metadata"]
+    st.caption(f"{_asset_label(asset)}  |  {result['cve_id']}")
+    priority, base, environmental = st.columns([1.4, 1, 1])
+    labels = {"P1": "Urgent", "P2": "High", "P3": "Medium", "P4": "Low"}
+    remediation_priority = result.get("priority")
+    investigation = result.get("investigation_priority")
+    if remediation_priority:
+        priority_text = f"{remediation_priority} — {labels.get(remediation_priority, '')}"
+        priority_note = "Organizational remediation priority"
+    elif investigation:
+        priority_text = f"{investigation} — Investigate"
+        priority_note = "Investigation priority only · applicability not confirmed"
+    else:
+        priority_text = "Not Applicable" if result.get("applicability") == "Not Applicable" else "Undetermined"
+        priority_note = "No organizational remediation priority assigned"
+    priority_class = {"P1": " priority", "P2": " priority priority-p2", "P3": " priority priority-p3", "P4": " priority priority-p4"}.get(remediation_priority, "")
+    priority.html(
+        '<div class="result-card' + priority_class + '">'
+        '<div class="card-label">Organizational Priority</div>'
+        f'<strong>{escape(priority_text)}</strong><div class="card-note">{escape(priority_note)}</div></div>'
+    )
+    for column, label, value, severity, source in (
+        (base, "Base CVSS", result.get("base_score"), result.get("base_severity", "—"), result.get("base_source", "NVD")),
+        (environmental, "Environmental CVSS", result.get("context_score"), result.get("environmental_severity", "—"), "Deterministic · CR / IR / AR"),
+    ):
+        score_text = f"{value:.1f}" if value is not None else "—"
+        severity_class = {"Critical": "severity-critical", "High": "severity-high", "Medium": "severity-medium", "Low": "severity-low"}.get(severity, "")
+        column.html(f'<div class="result-card"><div class="card-label">{escape(label)}</div>'
+                    f'<div class="score">{escape(score_text)}</div><span class="severity-badge {severity_class}">{escape(str(severity))}</span>'
+                    f'<div class="card-note">Technical severity · {escape(str(source))}</div></div>')
+    with st.container(border=True):
+        status = result.get("applicability", "Unknown")
+        with st.container(horizontal=True):
+            st.markdown("**Applicability**")
+            st.badge(status, color="green" if status == "Confirmed" else "gray")
+        if status == "Unknown":
+            st.caption("Unknown — not confirmed. Investigation priority is not remediation priority.")
+        st.write(result.get("applicability_explanation", ""))
+        if status == "Not Applicable":
+            st.caption("CVSS describes technical vulnerability severity; it does not imply this asset is affected.")
+    st.markdown("**Environmental Requirements**")
+    model_output = result.get("model_output", {})
+    for column, label, field in zip(st.columns(3), ("Confidentiality (CR)", "Integrity (IR)", "Availability (AR)"),
+                                    ("confidentiality_requirement", "integrity_requirement", "availability_requirement")):
+        code = model_output.get(field, "X")
+        value = {"H": "High", "M": "Medium", "L": "Low", "X": "Not Defined"}.get(code, "Not Defined")
+        requirement_class = {"H": "requirement-high", "M": "requirement-medium", "L": "requirement-low"}.get(code, "")
+        column.html(f'<div class="result-card requirement-card {requirement_class}"><div class="card-label">{escape(label)}</div>'
+                    f'<strong>{escape(value)}</strong></div>')
+    st.html('<div class="summary-card"><strong>AI Assessment Summary</strong>'
+            f'<p>{escape(str(model_output.get("justification", "No model summary available.")))}</p></div>')
+    with st.expander("Justification Details"):
+        st.write(result.get("priority_explanation", ""))
+        st.caption(f"Priority status: {result.get('priority_status', 'Unknown')}")
+        st.markdown("**Independent CR / IR / AR reasons and cited evidence**")
+        st.json(model_output.get("metric_reasons", {}))
+        st.markdown("**Remediation**")
+        st.write(model_output.get("remediation", ""))
+        st.caption(f"Model priority suggestion (not the deterministic result): {result.get('llm_priority', '—')}")
+        st.json(result.get("priority_result", {}))
+    with st.expander("Retrieved Context (RAG)"):
+        evidence = result.get("evidence", {})
+        retrieval = evidence.get("document_retrieval", {})
+        if not retrieval.get("accepted"):
+            st.warning("No accepted document evidence; this assessment used exact asset metadata only.")
+        if retrieval.get("error"):
+            st.warning(retrieval["error"])
+        st.caption("Accepted evidence was asset-filtered. Rejected candidates never entered model context.")
+        st.json(retrieval)
+        st.markdown("**Exact model context (sanitized)**")
+        st.json(evidence.get("model_context", {}))
+    with st.expander("Technical Details (CVSS, CPE, etc.)"):
+        st.code(f"Base: {result.get('vector_string', '')}\nEnvironmental: {result.get('modified_vector', '')}", language="text")
+        st.write(result.get("nvd_description", ""))
+        st.json(result.get("applicability_evidence", []))
+        st.markdown("**NVD source and snapshot provenance**")
+        st.json(result.get("evidence", {}).get("nvd", {}))
+        st.markdown("**Validated model output**")
+        st.json(model_output)
+    record = st.session_state.analysis_record
+    if st.session_state.get("analysis_saved"):
+        st.success("Assessment saved to history.")
+    elif record and st.button("Save to history", icon=":material/save:", key="save_analysis"):
+        try:
+            save_assessment(record)
+            if not any(item.id == record.id for item in load_history()):
+                st.error("History save could not be verified.")
+            else:
+                st.session_state.analysis_saved = True
+                st.rerun()
+        except Exception as exc:
+            st.error(f"History save failed: {exc}")
+
+
 def _render_vulnerability_analysis():
+    if st.session_state.analysis_result and not st.session_state.get("analysis_asset_preselect"):
+        with st.container(horizontal=True, vertical_alignment="center", gap="medium", key="analysis_header"):
+            st.header(":material/biotech: Vulnerability Analysis")
+            st.button("New Analysis", icon=":material/arrow_back:", key="new_analysis", on_click=_new_analysis)
+        _render_analysis_result()
+        return
     st.header(":material/biotech: Vulnerability Analysis")
+    st.caption("Select an asset and enter a CVE ID to analyze its impact on your organization.")
 
     assets = load_all_assets_metadata()
     asset_by_id = {a.get("asset_id", ""): a for a in assets}
@@ -596,21 +744,19 @@ def _render_vulnerability_analysis():
     elif st.session_state.analysis_asset_select not in options:
         st.session_state.analysis_asset_select = ""
 
-    selected_asset_id = st.selectbox(
-        "Select asset",
-        options=options,
-        format_func=lambda aid: "— select an asset —" if not aid else _asset_label(asset_by_id[aid]),
-        key="analysis_asset_select",
-    )
-
     with st.form("vulnerability_form"):
+        selected_asset_id = st.selectbox(
+            "Asset", options=options,
+            format_func=lambda aid: "— select an asset —" if not aid else _asset_label(asset_by_id[aid]),
+            key="analysis_asset_select",
+        )
         cve_input = st.text_input("CVE ID", placeholder="e.g. CVE-2021-44228", key="cve_input")
         with st.expander("Advanced settings"):
             retrieval_query_override = st.text_input(
-                "Asset retrieval query (optional)",
-                placeholder="Defaults to the selected asset name",
+                "Document retrieval query (optional)",
+                placeholder="Defaults to CVE description and selected asset",
                 key="analysis_retrieval_query",
-                help="Used to show semantic retrieval candidates. The selected stable asset ID remains the context source.",
+                help="Only documents filtered to the selected stable asset ID are eligible as evidence.",
             )
             base_vector_override = st.text_input(
                 "Base vector override (optional)",
@@ -618,21 +764,33 @@ def _render_vulnerability_analysis():
                 key="analysis_base_vector_override",
                 help="Only use a complete, validated CVSS v3 vector when supplying an explicit override.",
             )
-        submitted = st.form_submit_button("Run Analysis", type="primary", icon=":material/play_arrow:")
-
-    st.subheader("Analysis results")
-    result_container = st.container()
+            override_reason = st.text_input(
+                "Override reason", key="analysis_override_reason",
+                help="Required for a manual vector; overrides are excluded from the main NVD-only test set.",
+            )
+        cloud_consent = st.checkbox(
+            "I consent to send the selected asset context and accepted document evidence to Gemini.",
+            value=False, key="cloud_consent",
+            help="Organizational context leaves this device. No cloud request is made without explicit consent.",
+        )
+        submitted = st.form_submit_button("Run Analysis", type="primary", icon=":material/play_arrow:", width="stretch")
 
     if submitted:
         st.session_state.analysis_record = None
         st.session_state.analysis_result = None
-        cve_id = cve_input.strip().upper()
+        cve_id = cve_input
         if not selected_asset_id:
             st.error("Select an asset before running the analysis.")
-        elif not cve_id:
-            st.error("Enter a CVE ID before running the analysis.")
+        elif not re.fullmatch(r"CVE-\d{4}-\d{4,}", cve_id):
+            st.error("Enter a literal CVE ID in CVE-YYYY-NNNN format (uppercase, no whitespace).")
         elif not api_key:
-            st.error("Please enter a Gemini API Key in the sidebar.")
+            st.error("Please enter a Gemini API Key in Settings.")
+        elif not model_name.strip():
+            st.error("Enter a Gemini model in Settings.")
+        elif not cloud_consent:
+            st.error("Explicit cloud consent is required before submitting asset context to Gemini.")
+        elif base_vector_override and not override_reason.strip():
+            st.error("A reason is required for a manual Base vector override.")
         elif not vector_store:
             st.error(f"ChromaDB is not ready. Run `python ingest_assets.py --v2` to populate '{COLLECTION_NAME_V2}'.")
         else:
@@ -647,6 +805,7 @@ def _render_vulnerability_analysis():
                     st.error("NVD did not provide a CVSS v3 vector. Add a complete vector override in Advanced settings to calculate CVSS.")
                 else:
                     try:
+                        validate_base_vector(base_vector)
                         base_cvss_obj = CVSS3(base_vector)
                         calculated_base_score = base_cvss_obj.scores()[0]
                         base_score = (
@@ -666,46 +825,43 @@ def _render_vulnerability_analysis():
                             st.error(f"Could not load asset `{selected_asset_id}` from ChromaDB by stable asset ID.")
                         else:
                             asset_metadata = filtered_metadata(asset_source)
-                            retrieval_query = retrieval_query_override.strip() or str(asset_metadata.get("asset_name") or selected_asset_id)
-                            with st.spinner("Loading selected asset context and retrieval evidence..."):
-                                retrieval = retrieve_asset_context(
-                                    vector_store,
-                                    retrieval_query,
-                                    top_k=DEFAULT_TOP_K,
-                                    confidence_threshold=confidence_threshold,
-                                )
-
-                            selected_candidate = next(
-                                (candidate for candidate in retrieval.candidates
-                                 if str(candidate.metadata.get("asset_id") or "") == selected_asset_id),
-                                None,
+                            retrieval_query = retrieval_query_override.strip() or (
+                                f"{cve_id} {nvd_data.get('description', '')} {asset_metadata.get('asset_name', selected_asset_id)}"
                             )
-                            retrieval_confidence = selected_candidate.confidence if selected_candidate else None
-                            if retrieval_confidence is None:
-                                st.warning(
-                                    "The semantic retrieval did not return the selected asset as a candidate. "
-                                    "Analysis continues with the exact asset metadata loaded by stable asset ID; "
-                                    "no other asset is substituted."
+                            with st.spinner("Loading selected asset context and retrieval evidence..."):
+                                try:
+                                    context_store = load_context_db()
+                                except Exception as exc:
+                                    context_store = None
+                                    st.warning(f"Organizational documents unavailable: {exc}")
+                                retrieval = retrieve_document_context(
+                                    context_store, retrieval_query, selected_asset_id,
+                                    top_k=DEFAULT_TOP_K, relevance_threshold=confidence_threshold,
                                 )
-                            elif retrieval_confidence < confidence_threshold:
-                                st.warning(
-                                    f"The selected asset's semantic confidence ({retrieval_confidence:.3f}) is below "
-                                    f"the configured threshold ({confidence_threshold:.2f}). Analysis still uses "
-                                    "the exact selected asset ID; other candidates are not substituted."
-                                )
+                            retrieval_confidence = max(
+                                (item.relevance_score for item in retrieval.accepted if item.relevance_score is not None), default=None,
+                            )
+                            if not retrieval.accepted:
+                                st.warning("No accepted document evidence. The model receives only the exact selected asset metadata; RAG evidence is absent, not substituted.")
+                            model_context = build_model_context(
+                                asset_metadata, retrieved_evidence=[item.to_dict() for item in retrieval.accepted],
+                            )
 
                             asset_cpes = collect_asset_cpes(asset_metadata)
                             applicability = determine_applicability(
-                                asset_cpes, nvd_data.get("configurations")
+                                asset_cpes, nvd_data.get("configurations"),
+                                inventory_verified=inventory_is_verified(asset_source),
                             )
+                            model_description = nvd_data.get("description", "")[:20000]
 
                             with st.spinner("Running contextual assessment..."):
                                 try:
                                     llm_result = analyze_with_llm(
                                         api_key,
-                                        nvd_data.get("description", ""),
+                                        model_description,
                                         base_vector,
-                                        asset_metadata,
+                                        model_context,
+                                        model=model_name.strip(),
                                     )
                                     modified_vector_str = build_environmental_vector(base_vector, llm_result)
                                     cvss_obj = CVSS3(modified_vector_str)
@@ -723,122 +879,30 @@ def _render_vulnerability_analysis():
                                         cve_id=cve_id,
                                     )
 
-                                    with result_container:
-                                        st.success("Analysis complete!")
-                                        if applicability.status == ApplicabilityStatus.CONFIRMED:
-                                            st.badge("CPE applicability: Confirmed", icon=":material/warning:", color="red")
-                                        elif applicability.status == ApplicabilityStatus.NOT_APPLICABLE:
-                                            st.badge("CPE applicability: Not Applicable", icon=":material/check_circle:", color="green")
-                                        else:
-                                            st.badge("CPE applicability: Unknown — not confirmed", icon=":material/help:", color="gray")
-                                        st.caption(applicability.explanation)
-
-                                        metrics = st.columns(4)
-                                        metrics[0].metric("CVSS Base Score", f"{base_score:.1f}", delta="NVD" if not base_vector_override.strip() else "Validated override", delta_color="off", border=True)
-                                        delta_score = round(context_score - base_score, 1)
-                                        metrics[1].metric(
-                                            "Context-Aware CVSS Score",
-                                            f"{context_score:.1f}",
-                                            delta=f"{delta_score:+.1f}",
-                                            delta_color="inverse",
-                                            border=True,
-                                        )
-                                        metrics[2].metric(
-                                            "CVSS Severity",
-                                            base_severity,
-                                            delta=f"Context: {env_severity}",
-                                            delta_color="off",
-                                            border=True,
-                                        )
-                                        metrics[3].metric(
-                                            "Organizational Priority",
-                                            priority_result.priority or "INCOMPLETE",
-                                            help=priority_result.explanation,
-                                            border=True,
-                                        )
-
-                                        with st.expander("Assessment explanation and evidence", expanded=True):
-                                            st.markdown("**Contextual requirements assessed by the model**")
-                                            st.write(
-                                                f"CR: `{llm_result.confidentiality_requirement.value}`  "
-                                                f"IR: `{llm_result.integrity_requirement.value}`  "
-                                                f"AR: `{llm_result.availability_requirement.value}`"
-                                            )
-                                            st.markdown("**LLM justification**")
-                                            st.info(llm_result.justification)
-                                            st.markdown("**Remediation**")
-                                            st.write(llm_result.remediation)
-                                            st.markdown("**Deterministic organizational-priority rubric**")
-                                            st.write(priority_result.explanation)
-                                            st.caption(
-                                                "LLM priority suggestion (separate from the deterministic result): "
-                                                f"{llm_result.organizational_priority.value}"
-                                            )
-                                            with st.expander("Priority rule contributions"):
-                                                st.json([
-                                                    {
-                                                        "rule": contribution.rule,
-                                                        "factor": contribution.factor,
-                                                        "value": contribution.evidence_value,
-                                                        "points": contribution.points,
-                                                        "max_points": contribution.max_points,
-                                                        "evidence_source": contribution.evidence_source,
-                                                    }
-                                                    for contribution in priority_result.rule_contributions
-                                                ])
-                                            if priority_result.missing_evidence:
-                                                st.error("Missing evidence: " + ", ".join(priority_result.missing_evidence))
-                                            if priority_result.unknown_factors:
-                                                st.caption(
-                                                    "Optional evidence not available (counted as 0, not low risk): "
-                                                    + ", ".join(priority_result.unknown_factors)
-                                                )
-                                            st.caption("No verified dependency relationships were supplied; dependency points were not added.")
-
-                                        with st.expander("CPE applicability evidence"):
-                                            if applicability.evidence:
-                                                st.json([dict(evidence) for evidence in applicability.evidence])
-                                            else:
-                                                st.write(f"Asset CPEs evaluated: {asset_cpes or 'none'}")
-
-                                        with st.expander("Selected asset context and RAG evidence"):
-                                            st.markdown(
-                                                f"**Context source:** ChromaDB metadata for selected asset ID `{selected_asset_id}`  \n"
-                                                f"**Semantic retrieval query:** {retrieval_query}  \n"
-                                                f"**Selected asset confidence:** "
-                                                + (f"{retrieval_confidence:.3f} (threshold {confidence_threshold:.2f})" if retrieval_confidence is not None else "not returned")
-                                            )
-                                            st.json(asset_metadata)
-                                            st.markdown("**Top semantic candidates (evidence only; not substituted):**")
-                                            if retrieval.candidates:
-                                                for candidate in retrieval.candidates:
-                                                    marker = "Selected asset" if str(candidate.metadata.get("asset_id") or "") == selected_asset_id else "Not selected"
-                                                    st.write(
-                                                        f"{marker}: `{candidate.metadata.get('asset_id', '?')}` "
-                                                        f"{candidate.metadata.get('asset_name', '?')} — confidence={candidate.confidence:.3f}"
-                                                    )
-                                            else:
-                                                st.caption("No semantic retrieval candidates were returned.")
-
-                                        with st.expander("CVSS vectors"):
-                                            st.code(
-                                                f"Base: {base_vector}\nEnvironmental: {modified_vector_str}",
-                                                language="text",
-                                            )
-
                                     evidence = {
                                         "retrieval_query": retrieval_query,
-                                        "retrieval_candidates": [
-                                            {
-                                                "asset_id": candidate.metadata.get("asset_id"),
-                                                "asset_name": candidate.metadata.get("asset_name"),
-                                                "confidence": candidate.confidence,
-                                            }
-                                            for candidate in retrieval.candidates
-                                        ],
+                                        "document_retrieval": retrieval.to_dict(),
+                                        "model_context": model_context,
                                         "selected_asset_context": asset_metadata,
+                                        "nvd": nvd_data,
                                         "llm_justification": llm_result.justification,
                                         "llm_remediation": llm_result.remediation,
+                                    }
+                                    model_output = llm_result.model_dump(mode="json")
+                                    provenance = {
+                                        "model": model_name.strip(), "cloud_consent": True,
+                                        "vector_origin": "manual_override" if base_vector_override else "nvd",
+                                        "override_reason": override_reason if base_vector_override else None,
+                                        "main_test_set_eligible": not bool(base_vector_override),
+                                        "context_mode": "hybrid_rag" if model_context.get("retrieved_evidence") else "direct_context_no_document_evidence",
+                                        "nvd": nvd_data, "base_vector_override": base_vector_override.strip(),
+                                        "model_input": {"cve_desc": model_description,
+                                                        "original_vector": base_vector, "asset_context": model_context},
+                                        "model_payload": {"cve_description": model_description,
+                                                          "original_nvd_vector": base_vector,
+                                                          "organizational_context": model_context},
+                                        "retrieval": retrieval.to_dict(),
+                                        "rubric_version": getattr(priority_result, "rubric_version", None),
                                     }
                                     st.session_state.analysis_result = {
                                         "cve_id": cve_id,
@@ -847,7 +911,15 @@ def _render_vulnerability_analysis():
                                         "nvd_base_score": nvd_data.get("base_score"),
                                         "base_score": base_score,
                                         "context_score": context_score,
+                                        "base_severity": base_severity,
+                                        "environmental_severity": env_severity,
                                         "priority": priority_result.priority,
+                                        "investigation_priority": getattr(priority_result, "investigation_priority", None),
+                                        "priority_status": priority_result.status,
+                                        "priority_explanation": priority_result.explanation,
+                                        "priority_result": asdict(priority_result),
+                                        "model_output": model_output,
+                                        "base_source": "Validated override" if base_vector_override.strip() else "NVD",
                                         "llm_priority": llm_result.organizational_priority.value,
                                         "vector_string": base_vector,
                                         "modified_vector": modified_vector_str,
@@ -873,7 +945,11 @@ def _render_vulnerability_analysis():
                                         applicability_evidence=[dict(e) for e in applicability.evidence],
                                         priority_result=priority_result,
                                         graph_dependencies=graph_dependencies,
+                                        model_output=model_output,
+                                        provenance=provenance,
                                     )
+                                    st.session_state.analysis_saved = False
+                                    st.rerun()
                                 except LlmAssessmentError as e:
                                     st.error(f"LLM assessment was rejected/invalid; CVSS calculation stopped: {e}")
                                 except Exception as e:
@@ -881,18 +957,9 @@ def _render_vulnerability_analysis():
     else:
         st.info("Select an asset, enter a CVE ID, and run the analysis.")
 
-    # Save UI is rendered outside the analysis run so the button click survives
-    # the rerun it triggers.
-    if st.session_state.analysis_record:
-        if st.button("Save to history", icon=":material/save:"):
-            save_assessment(st.session_state.analysis_record)
-            st.session_state.analysis_record = None
-            st.success("Assessment saved to history.")
-            st.rerun()
-
-
 def _render_analysis_history():
     st.header(":material/history: Analysis History")
+    st.caption("View previous vulnerability assessments.")
 
     history = load_history()
     if not history:
@@ -901,30 +968,56 @@ def _render_analysis_history():
 
     st.caption(f"{len(history)} assessment(s) recorded")
 
-    for idx, record in enumerate(reversed(history)):
+    history_table = pd.DataFrame([
+        {"Date": record.timestamp[:19].replace("T", " "), "CVE ID": record.cve_id,
+         "Asset": record.asset_id, "Priority": record.priority or "—",
+         "Investigation Priority": getattr(record, "investigation_priority", None) or "—",
+         "Base CVSS": record.base_score, "Env CVSS": record.context_score,
+         "Applicability": record.applicability or "Unknown"}
+        for record in reversed(history)
+    ])
+    st.dataframe(history_table, hide_index=True, width="stretch")
+    st.download_button("Export history (JSON)", data=json.dumps([asdict(record) for record in history], indent=2),
+                       file_name="assessment_history.json", mime="application/json", key="export_history")
+    ordered = list(reversed(history))
+    if st.session_state.get("history_selected", 0) not in range(len(ordered)):
+        del st.session_state["history_selected"]
+    selected = st.selectbox("Assessment details", options=range(len(ordered)), key="history_selected",
+                            format_func=lambda index: f"{ordered[index].timestamp[:19]} · {ordered[index].cve_id} · {ordered[index].asset_id}")
+
+    for idx, record in [(selected, ordered[selected])]:
         with st.container(border=True):
             c1, c2, c3 = st.columns([3, 1, 1])
             with c1:
                 st.markdown(f"**{record.cve_id}** on {record.asset_name or record.asset_id}")
                 st.caption(f"{record.timestamp[:19].replace('T', ' ')}")
             with c2:
-                st.badge(str(record.priority) if record.priority else "INCOMPLETE", color="blue")
+                st.badge(str(record.priority) if record.priority else "No remediation priority", color="blue")
             with c3:
                 if st.button("Delete", key=f"del_hist_{idx}"):
                     delete_record(record)
-                    st.rerun()
+                    remaining = load_history()
+                    still_present = any(item.id == record.id for item in remaining) if record.id else any(
+                        asdict(item) == asdict(record) for item in remaining
+                    )
+                    if still_present:
+                        st.error("History deletion could not be verified.")
+                    else:
+                        st.rerun()
 
             with st.expander("Details"):
                 col_a, col_b, col_c = st.columns(3)
                 col_a.metric("Base CVSS", record.base_score, border=True)
-                col_b.metric("Context score", record.context_score if record.context_score is not None else "—", border=True)
+                col_b.metric("Environmental CVSS", record.context_score if record.context_score is not None else "—", border=True)
                 col_c.metric("LLM priority", record.llm_priority, border=True)
 
                 st.markdown("**Organizational Priority (deterministic):**")
+                if getattr(record, "investigation_priority", None):
+                    st.write(f"Investigation priority only: {record.investigation_priority}; not a remediation priority.")
                 if record.priority_status:
-                    st.write(f"`{record.priority or 'INCOMPLETE'}` ({record.priority_status}) — score {record.priority_score}/{100}")
+                    st.write(f"{record.priority or 'Not assigned'} ({record.priority_status}) — rubric score {record.priority_score}/100")
                 else:
-                    st.write(f"`{record.priority or 'INCOMPLETE'}`")
+                    st.write(record.priority or "Not assigned")
                 if record.priority_explanation:
                     st.info(record.priority_explanation)
                 if record.priority_missing_evidence:
@@ -953,14 +1046,18 @@ def _render_analysis_history():
                 if record.evidence and record.evidence.get("llm_justification"):
                     st.markdown("**LLM justification:**")
                     st.info(record.evidence["llm_justification"])
+                st.markdown("**Evidence and model input**")
+                st.json(record.evidence or {})
+                st.markdown("**Validated model output**")
+                st.json(getattr(record, "model_output", None) or {})
+                st.markdown("**Provenance**")
+                st.json(getattr(record, "provenance", None) or {})
 
 
 # ---------------------------------------------------------------------------
 # 6. DISPATCH
 # ---------------------------------------------------------------------------
-if page == "Dashboard":
-    _render_dashboard()
-elif page == "Asset Inventory":
+if page == "Asset Inventory":
     _render_asset_inventory()
 elif page == "Vulnerability Analysis":
     _render_vulnerability_analysis()

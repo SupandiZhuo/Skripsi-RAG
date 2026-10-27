@@ -6,46 +6,42 @@ CVSS severity measures the technical characteristics of the vulnerability,
 while this rubric measures how urgently the organization should remediate it
 on this asset.
 
-Rubric (max 100 points):
+Active rubric: seven factors totaling exactly 100 points, defined by
+FACTOR_MAX_POINTS. Thresholds: P1 >= 80, P2 >= 60, P3 >= 40, else P4.
+Only Confirmed applicability can produce a remediation priority.
+Not Applicable produces priority=None and status="not_applicable".
+Unknown produces priority=None, status="needs_verification", and a separate
+investigation_priority when business-criticality evidence supports triage.
+Missing/invalid applicability never authorizes remediation classification.
 
-  Factor                          Points                                  Kind
-  ------------------------------  --------------------------------------  --------
-  Vulnerability severity          Critical 20 / High 15 / Medium 8 / Low 2  required
-  Business criticality            Mission Critical 25 / High 18 /       required
-                                  Medium 10 / Low 3
-  Internet exposure               yes=15 / DMZ=10 / no=0                  required
-  Data sensitivity                Restricted 8 / Confidential 5 /         optional
-                                  Internal 2 / Public 0
-  Environment                     production=5 (others 0)                 optional
-  CIA baseline                    any declared H = 2                      optional
-  CPE applicability               Confirmed 15 / Unknown 5 /              required
-                                  Not Applicable 0 (caps at P4)
-  Graph dependencies              incoming dependency = 10 /              optional
-                                  outgoing dependency = 5
-
-  Thresholds: P1 (Urgent) >= 80 | P2 (High) >= 60 | P3 (Normal) >= 40 | P4 (Low) < 40
-
-Design rules:
-- Not Applicable CPE status caps the result at P4, because a CVE that does
-  not affect the asset does not warrant urgent remediation.
-- Missing required evidence (business criticality, or both vulnerability
-  severity AND applicability) produces an explicit incomplete state with
-  priority=None instead of silently defaulting to low risk.
-- Optional unknown factors contribute 0 points and are listed in
-  `unknown_factors`; they do not block classification.
-- Graph dependencies are used only when the caller supplies verified
-  relationship data; no relationships are fabricated.
-- Identical inputs always produce identical outputs (pure function, frozen
-  result dataclasses).
+Graph dependencies are inactive: the API argument is retained for caller
+compatibility but has no effect, even when relationship data is supplied.
+Optional unknown factors contribute zero and remain explicitly disclosed.
+Weights and thresholds are researcher-defined, not expert-approved or
+empirically validated. See docs/PRIORITY_RUBRIC.md for the active policy.
+Identical inputs produce identical frozen-dataclass results.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
+from math import isfinite
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from cve_applicability import ApplicabilityStatus
 
-MAX_SCORE = 100
+RUBRIC_VERSION = "organizational-priority-v2.0"
+
+FACTOR_MAX_POINTS: Dict[str, int] = {
+    "vulnerability severity": 30,
+    "business criticality": 25,
+    "internet exposure": 15,
+    "data sensitivity": 8,
+    "environment": 5,
+    "CIA baseline": 2,
+    "CPE applicability": 15,
+}
+MAX_SCORE = sum(FACTOR_MAX_POINTS.values())
+assert MAX_SCORE == 100, "Review active factor weights before running experiments"
 
 # Thresholds for P1..P4.
 SCORE_THRESHOLDS: Sequence[Tuple[int, str, str]] = (
@@ -56,10 +52,11 @@ SCORE_THRESHOLDS: Sequence[Tuple[int, str, str]] = (
 
 # Factor point tables.
 _SEVERITY_POINTS: Dict[str, int] = {
-    "Critical": 20,
-    "High": 15,
-    "Medium": 8,
-    "Low": 2,
+    "None": 0,
+    "Critical": 30,
+    "High": 23,
+    "Medium": 12,
+    "Low": 3,
 }
 _CRITICALITY_POINTS: Dict[str, int] = {
     "Mission Critical": 25,
@@ -77,6 +74,7 @@ _SENSITIVITY_POINTS: Dict[str, int] = {
 _STATUS_COMPLETE = "complete"
 _STATUS_INCOMPLETE = "incomplete"
 _STATUS_NOT_APPLICABLE = "not_applicable"
+_STATUS_NEEDS_VERIFICATION = "needs_verification"
 
 
 class PriorityLevel(str, Enum):
@@ -103,7 +101,7 @@ class OrganizationalPriorityResult:
     """Structured, reproducible result of the priority rubric."""
 
     priority: Optional[str]  # P1..P4 or None
-    status: str  # complete | incomplete | not_applicable
+    status: str  # complete | incomplete | not_applicable | needs_verification
     score: Optional[int]
     max_score: int
     level: Optional[str]  # Urgent / High / Normal / Low
@@ -113,10 +111,12 @@ class OrganizationalPriorityResult:
     explanation: str
     cve_id: Optional[str] = None
     asset_id: Optional[str] = None
+    investigation_priority: Optional[str] = None  # triage only, never remediation
+    rubric_version: str = RUBRIC_VERSION
 
 
 def _severity_band(score: Optional[float]) -> Optional[str]:
-    if score is None:
+    if score is None or not isfinite(score) or not 0.0 <= score <= 10.0:
         return None
     if score >= 9.0:
         return "Critical"
@@ -126,7 +126,7 @@ def _severity_band(score: Optional[float]) -> Optional[str]:
         return "Medium"
     if score > 0.0:
         return "Low"
-    return None
+    return "None"
 
 
 def _level_for_score(score: int) -> Tuple[str, str]:
@@ -151,9 +151,27 @@ def _build_explanation(
 ) -> str:
     if status == _STATUS_NOT_APPLICABLE:
         lines = [
-            "P4 (Low) — the CVE is Not Applicable to this asset based on CPE matching; "
-            "no urgent remediation is warranted.",
+            "Not Applicable — exclude this CVE/asset pair from the remediation queue; "
+            "no remediation priority is assigned.",
         ]
+    elif status == _STATUS_NEEDS_VERIFICATION:
+        if priority is None:
+            lines = [
+                "Applicability is Unknown: verify whether the CVE affects the asset. "
+                "An investigation priority cannot be determined because required evidence is missing: "
+                + ", ".join(missing) + ". This is not a remediation decision."
+            ]
+        else:
+            lines = [
+                f"Investigation priority {priority} ({level}) — provisional triage score "
+                f"{score}/{MAX_SCORE}. Applicability is Unknown: verify the affected "
+                "product/version before assigning remediation. This is not a remediation priority."
+            ]
+        if contributions:
+            lines.append("Available evidence: " + "; ".join(
+                f"{c.factor}={c.evidence_value} ({c.points}/{c.max_points})"
+                for c in contributions
+            ) + ".")
     elif status == _STATUS_INCOMPLETE:
         lines = [
             "Priority cannot be determined confidently because required evidence is missing: "
@@ -182,7 +200,7 @@ def _build_explanation(
 
     if unknowns:
         lines.append(
-            "Optional factors with unknown evidence (counted as 0, not low risk): "
+            "Unknown evidence (optional factors counted as 0, not low risk): "
             + ", ".join(unknowns) + "."
         )
     return " ".join(lines)
@@ -205,14 +223,14 @@ def calculate_organizational_priority(
         context_score: Optional contextual/environmental CVSS score.
         applicability: Optional ApplicabilityResult or dict-like object with a
             `.status` or `['status']` attribute/value.
-        graph_dependencies: Optional dict with keys like
-            `incoming_count` / `outgoing_count` describing verified graph
-            relationships for the asset.
+        graph_dependencies: Compatibility-only argument; ignored by the active
+            rubric. No graph points or graph missing-evidence penalty is used.
         cve_id: Optional CVE identifier for traceability.
 
     Returns:
         OrganizationalPriorityResult with priority, status, score,
-        contributions, missing/unknown evidence, and explanation.
+        contributions, missing/unknown evidence, and explanation. Unknown
+        applicability uses investigation_priority, never remediation priority.
     """
     ctx: Mapping[str, Any] = asset_metadata if isinstance(asset_metadata, Mapping) else {}
     asset_id = _text(ctx.get("asset_id")) or None
@@ -222,7 +240,7 @@ def calculate_organizational_priority(
     unknowns: List[str] = []
     score = 0
 
-    # --- CPE applicability (evaluated first because it can cap or block) ---
+    # --- CPE applicability (evaluated first because it can exclude or block) ---
     app_status: Optional[Any] = None
     app_evidence_source = "cve_applicability"
     if hasattr(applicability, "status"):
@@ -241,18 +259,19 @@ def calculate_organizational_priority(
         app_status = ""
 
     if app_status == ApplicabilityStatus.NOT_APPLICABLE:
-        # CVE does not affect this asset -> priority is P4 by definition.
+        # CVE does not affect this asset: exclude, do not label as low priority.
         return OrganizationalPriorityResult(
-            priority="P4",
+            priority=None,
             status=_STATUS_NOT_APPLICABLE,
-            score=0,
+            score=None,
             max_score=MAX_SCORE,
-            level="Low",
+            level=None,
             rule_contributions=(),
             missing_evidence=(),
             unknown_factors=(),
-            explanation="P4 (Low) — the CVE is Not Applicable to this asset based on CPE matching; "
-                        "no urgent remediation is warranted.",
+            explanation=_build_explanation(
+                None, None, None, (), (), (), _STATUS_NOT_APPLICABLE,
+            ),
             cve_id=cve_id,
             asset_id=asset_id,
         )
@@ -261,13 +280,12 @@ def calculate_organizational_priority(
     severity: Optional[str] = None
     severity_source = "nvd.base_score"
     severity_score = context_score
-    if severity_score is not None and severity_score > 0.0:
+    if _severity_band(severity_score) is not None:
         severity_source = "contextual.cvss_environmental_score"
     else:
         severity_score = base_score
 
-    if severity_score is not None and severity_score > 0.0:
-        severity = _severity_band(severity_score)
+    severity = _severity_band(severity_score)
 
     if severity:
         points = _SEVERITY_POINTS[severity]
@@ -277,7 +295,7 @@ def calculate_organizational_priority(
                 rule=f"vulnerability_severity:{severity}",
                 factor="vulnerability severity",
                 points=points,
-                max_points=20,
+                max_points=FACTOR_MAX_POINTS["vulnerability severity"],
                 evidence_value=f"{severity} ({severity_score:g})",
                 evidence_source=severity_source,
             )
@@ -295,7 +313,7 @@ def calculate_organizational_priority(
                 rule=f"business_criticality:{criticality}",
                 factor="business criticality",
                 points=points,
-                max_points=25,
+                max_points=FACTOR_MAX_POINTS["business criticality"],
                 evidence_value=criticality,
                 evidence_source="asset.business_criticality",
             )
@@ -314,7 +332,7 @@ def calculate_organizational_priority(
                 rule="exposure:internet_exposed_yes",
                 factor="internet exposure",
                 points=15,
-                max_points=15,
+                max_points=FACTOR_MAX_POINTS["internet exposure"],
                 evidence_value="internet_exposed=yes",
                 evidence_source="asset.internet_exposed",
             )
@@ -326,7 +344,7 @@ def calculate_organizational_priority(
                 rule="exposure:dmz_inferred",
                 factor="internet exposure",
                 points=10,
-                max_points=15,
+                max_points=FACTOR_MAX_POINTS["internet exposure"],
                 evidence_value="network_zone=DMZ (internet-adjacent)",
                 evidence_source="asset.network_zone",
             )
@@ -337,7 +355,7 @@ def calculate_organizational_priority(
                 rule="exposure:not_exposed",
                 factor="internet exposure",
                 points=0,
-                max_points=15,
+                max_points=FACTOR_MAX_POINTS["internet exposure"],
                 evidence_value=f"internet_exposed={exposed or 'unknown'}; network_zone={zone or 'unknown'}",
                 evidence_source="asset.internet_exposed / asset.network_zone",
             )
@@ -350,7 +368,7 @@ def calculate_organizational_priority(
                 rule="exposure:unknown",
                 factor="internet exposure",
                 points=0,
-                max_points=15,
+                max_points=FACTOR_MAX_POINTS["internet exposure"],
                 evidence_value=f"internet_exposed={exposed or 'unknown'}; network_zone={zone or 'unknown'}",
                 evidence_source="asset.internet_exposed / asset.network_zone",
             )
@@ -367,7 +385,7 @@ def calculate_organizational_priority(
                 rule=f"data_sensitivity:{sensitivity}",
                 factor="data sensitivity",
                 points=points,
-                max_points=8,
+                max_points=FACTOR_MAX_POINTS["data sensitivity"],
                 evidence_value=sensitivity,
                 evidence_source="asset.data_sensitivity",
             )
@@ -384,7 +402,7 @@ def calculate_organizational_priority(
                 rule="environment:production",
                 factor="environment",
                 points=5,
-                max_points=5,
+                max_points=FACTOR_MAX_POINTS["environment"],
                 evidence_value="production",
                 evidence_source="asset.environment",
             )
@@ -395,7 +413,7 @@ def calculate_organizational_priority(
                 rule=f"environment:{environment}",
                 factor="environment",
                 points=0,
-                max_points=5,
+                max_points=FACTOR_MAX_POINTS["environment"],
                 evidence_value=environment,
                 evidence_source="asset.environment",
             )
@@ -415,7 +433,7 @@ def calculate_organizational_priority(
                 rule="cia_baseline:high_declared",
                 factor="CIA baseline",
                 points=2,
-                max_points=2,
+                max_points=FACTOR_MAX_POINTS["CIA baseline"],
                 evidence_value="at least one CR/IR/AR = H",
                 evidence_source="asset.confidentiality_requirement/integrity_requirement/availability_requirement",
             )
@@ -426,7 +444,7 @@ def calculate_organizational_priority(
                 rule="cia_baseline:non_high",
                 factor="CIA baseline",
                 points=0,
-                max_points=2,
+                max_points=FACTOR_MAX_POINTS["CIA baseline"],
                 evidence_value="no CR/IR/AR = H",
                 evidence_source="asset.confidentiality_requirement/integrity_requirement/availability_requirement",
             )
@@ -442,7 +460,7 @@ def calculate_organizational_priority(
                 rule="applicability:confirmed",
                 factor="CPE applicability",
                 points=15,
-                max_points=15,
+                max_points=FACTOR_MAX_POINTS["CPE applicability"],
                 evidence_value="Confirmed",
                 evidence_source=app_evidence_source,
             )
@@ -454,7 +472,7 @@ def calculate_organizational_priority(
                 rule="applicability:unknown",
                 factor="CPE applicability",
                 points=5,
-                max_points=15,
+                max_points=FACTOR_MAX_POINTS["CPE applicability"],
                 evidence_value="Unknown",
                 evidence_source=app_evidence_source,
             )
@@ -463,45 +481,42 @@ def calculate_organizational_priority(
     else:
         missing.append("CPE applicability")
 
-    # --- Graph dependencies (optional) ---
-    dep_points = 0
-    dep_description = []
-    if graph_dependencies:
-        incoming = int(graph_dependencies.get("incoming_count", 0))
-        outgoing = int(graph_dependencies.get("outgoing_count", 0))
-        if incoming > 0:
-            dep_points += 10
-            dep_description.append(f"{incoming} incoming dependency(s)")
-        if outgoing > 0:
-            dep_points += 5
-            dep_description.append(f"{outgoing} outgoing dependency(s)")
-    if dep_points > 0:
-        score += dep_points
-        contributions.append(
-            PriorityRuleContribution(
-                rule=f"graph_dependencies:{dep_points}",
-                factor="business dependencies",
-                points=dep_points,
-                max_points=15,
-                evidence_value="; ".join(dep_description),
-                evidence_source="asset_graph",
-            )
-        )
-    else:
-        unknowns.append("business dependencies")
+    # graph_dependencies is intentionally ignored (compatibility-only).
 
     # --- Status resolution ---
-    has_required_severity = severity is not None
     has_required_criticality = criticality in _CRITICALITY_POINTS
-    has_required_applicability = app_status in (
-        ApplicabilityStatus.CONFIRMED,
-        ApplicabilityStatus.UNKNOWN,
-    )
-    # We need severity OR applicability to reason about urgency; criticality is mandatory.
-    # Exposure is intentionally treated as optional (unknown = 0 points, not blocking).
-    can_classify = has_required_criticality and (
-        has_required_severity or has_required_applicability
-    )
+    missing = list(dict.fromkeys(missing))
+    if app_status == ApplicabilityStatus.UNKNOWN:
+        # Unknown never enters the confirmed-remediation queue. The score and
+        # P-band here rank verification work, not patching decisions.
+        investigation_priority = None
+        investigation_level = None
+        investigation_score = None
+        if has_required_criticality:
+            investigation_score = score
+            investigation_priority, investigation_level = _level_for_score(score)
+        return OrganizationalPriorityResult(
+            priority=None,
+            status=_STATUS_NEEDS_VERIFICATION,
+            score=investigation_score,
+            max_score=MAX_SCORE,
+            level=None,
+            rule_contributions=tuple(contributions),
+            missing_evidence=tuple(missing),
+            unknown_factors=tuple(unknowns),
+            explanation=_build_explanation(
+                investigation_priority, investigation_level, investigation_score,
+                contributions, missing, unknowns, _STATUS_NEEDS_VERIFICATION,
+            ),
+            cve_id=cve_id,
+            asset_id=asset_id,
+            investigation_priority=investigation_priority,
+        )
+
+    # Confirmed applicability is mandatory for remediation. Exposure remains
+    # optional (unknown = 0, disclosed); confirmed applicability can support
+    # classification when numerical severity is missing, as in the prior API.
+    can_classify = has_required_criticality and app_status == ApplicabilityStatus.CONFIRMED
 
     if not can_classify:
         missing = list(dict.fromkeys(missing))  # dedupe while preserving order
@@ -527,7 +542,7 @@ def calculate_organizational_priority(
         max_score=MAX_SCORE,
         level=level,
         rule_contributions=tuple(contributions),
-        missing_evidence=(),
+        missing_evidence=tuple(missing),
         unknown_factors=tuple(unknowns),
         explanation=_build_explanation(priority, level, score, contributions, missing, unknowns, _STATUS_COMPLETE),
         cve_id=cve_id,
