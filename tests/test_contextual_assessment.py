@@ -14,7 +14,7 @@ import pytest
 from cvss import CVSS3
 from pydantic import ValidationError
 
-from app import build_environmental_vector
+from cvss_engine import build_environmental_vector
 from llm_assessment import (
     CiaRequirement,
     ContextualAssessment,
@@ -31,6 +31,11 @@ def make_assessment(cr="H", ir="M", ar="L", priority="P1"):
         confidentiality_requirement=cr,
         integrity_requirement=ir,
         availability_requirement=ar,
+        metric_reasons={
+            metric: {"reason": f"Independent {metric} requirement from asset registry evidence.",
+                     "evidence_ids": ["asset:A1"]}
+            for metric in ("CR", "IR", "AR")
+        },
         organizational_priority=priority,
         justification="Asset holds regulated customer data per RAG context.",
         remediation="Patch immediately and restrict network access.",
@@ -77,15 +82,35 @@ def test_invalid_organizational_priority_rejected():
 
 
 def test_blank_justification_rejected():
+    payload = make_assessment().model_dump()
+    payload["justification"] = "   "
     with pytest.raises(ValidationError):
-        ContextualAssessment(
-            confidentiality_requirement="H",
-            integrity_requirement="H",
-            availability_requirement="H",
-            organizational_priority="P1",
-            justification="   ",
-            remediation="Patch now.",
-        )
+        ContextualAssessment(**payload)
+
+
+def test_metric_reasons_are_required():
+    payload = make_assessment().model_dump()
+    del payload["metric_reasons"]
+    with pytest.raises(ValidationError, match="metric_reasons"):
+        ContextualAssessment(**payload)
+
+
+@pytest.mark.parametrize("metric", ["CR", "IR", "AR"])
+def test_defined_metric_requires_cited_evidence(metric):
+    payload = make_assessment().model_dump()
+    payload["metric_reasons"][metric]["evidence_ids"] = []
+    with pytest.raises(ValidationError, match=f"{metric} requires cited evidence"):
+        ContextualAssessment(**payload)
+
+
+def test_undefined_metrics_allow_explicit_insufficient_evidence_reasons():
+    payload = make_assessment(cr="X", ir="X", ar="X").model_dump()
+    payload["metric_reasons"] = {
+        metric: {"reason": "Insufficient organizational evidence.", "evidence_ids": []}
+        for metric in ("CR", "IR", "AR")
+    }
+    assessment = ContextualAssessment(**payload)
+    assert all(not getattr(assessment.metric_reasons, metric).evidence_ids for metric in ("CR", "IR", "AR"))
 
 
 # ---------------------------------------------------------------------------
@@ -104,16 +129,11 @@ def test_base_metrics_preserved_and_no_mav():
     assert "AR:L" in modified
 
 
-def test_environmental_vector_is_idempotent_against_preexisting_env_metrics():
-    # Simulates a base vector that already had environmental metrics (e.g. rerun) -
-    # old CR/IR/AR/MAV must be stripped, not duplicated.
-    vector_with_env = BASE_VECTOR + "/CR:X/IR:X/AR:X/MAV:A"
-    assessment = make_assessment(cr="H", ir="H", ar="H")
-    modified = build_environmental_vector(vector_with_env, assessment)
-    assert modified.count("CR:") == 1
-    assert modified.count("IR:") == 1
-    assert modified.count("AR:") == 1
-    assert "MAV:" not in modified
+@pytest.mark.parametrize("suffix", ["/CR:X", "/IR:X", "/AR:X", "/MAV:A", "/CR:X/IR:X/AR:X/MAV:A"])
+def test_preexisting_environmental_metrics_rejected(suffix):
+    # NVD input must be Base-only; never silently strip contextual metrics.
+    with pytest.raises(ValueError, match="Unsupported metric"):
+        build_environmental_vector(BASE_VECTOR + suffix, make_assessment())
 
 
 def test_invalid_base_vector_rejected():
@@ -141,19 +161,15 @@ def test_cvss3_parses_generated_vector_and_scores_deterministically():
 # 7. Malformed/refused model output handling (mocked, no live API calls)
 # ---------------------------------------------------------------------------
 def test_analyze_with_llm_raises_on_malformed_response():
-    with patch("llm_assessment._build_llm") as mock_build_llm:
-        mock_llm = mock_build_llm.return_value
-        mock_structured = mock_llm.with_structured_output.return_value
-        mock_chain = mock_structured.__or__ = None  # not used directly
-
+    with patch("llm_assessment._build_llm"):
         # Simulate `prompt | structured_llm` chain whose .invoke() returns
         # something that is not a ContextualAssessment (malformed output).
         class FakeChain:
             def invoke(self, _):
                 return {"not": "a ContextualAssessment"}
 
-        with patch("llm_assessment.PromptTemplate.__or__", return_value=FakeChain()):
-            with pytest.raises(LlmAssessmentError):
+        with patch("llm_assessment.ChatPromptTemplate.__or__", return_value=FakeChain()):
+            with pytest.raises(LlmAssessmentError, match="Unrecognized structured model response"):
                 analyze_with_llm(
                     api_key="fake-key",
                     cve_desc="Some CVE description",
@@ -167,8 +183,8 @@ def test_analyze_with_llm_raises_on_exception_during_invoke():
         def invoke(self, _):
             raise RuntimeError("simulated provider failure")
 
-    with patch("llm_assessment.PromptTemplate.__or__", return_value=RaisingChain()):
-        with pytest.raises(LlmAssessmentError):
+    with patch("llm_assessment._build_llm"), patch("llm_assessment.ChatPromptTemplate.__or__", return_value=RaisingChain()):
+        with pytest.raises(LlmAssessmentError, match="simulated provider failure"):
             analyze_with_llm(
                 api_key="fake-key",
                 cve_desc="Some CVE description",
@@ -184,7 +200,7 @@ def test_analyze_with_llm_returns_valid_assessment_when_mocked():
         def invoke(self, _):
             return expected
 
-    with patch("llm_assessment.PromptTemplate.__or__", return_value=FakeChain()):
+    with patch("llm_assessment._build_llm"), patch("llm_assessment.ChatPromptTemplate.__or__", return_value=FakeChain()):
         result = analyze_with_llm(
             api_key="fake-key",
             cve_desc="Some CVE description",
@@ -192,6 +208,19 @@ def test_analyze_with_llm_returns_valid_assessment_when_mocked():
             asset_context={"asset_id": "A1"},
         )
 
-    assert result is expected
+    assert result == expected  # Provider output is revalidated, not returned unchecked.
     assert result.confidentiality_requirement == CiaRequirement.MEDIUM
     assert result.organizational_priority == OrganizationalPriority.P2
+
+
+def test_analyze_with_llm_rejects_citations_absent_from_supplied_context():
+    class FakeChain:
+        def invoke(self, _):
+            return make_assessment()  # Cites asset:A1, not the supplied asset:A2.
+
+    with patch("llm_assessment._build_llm"), patch("llm_assessment.ChatPromptTemplate.__or__", return_value=FakeChain()):
+        with pytest.raises(LlmAssessmentError, match="evidence IDs absent from model input"):
+            analyze_with_llm(
+                api_key="fake-key", cve_desc="Some CVE description",
+                original_vector=BASE_VECTOR, asset_context={"asset_id": "A2"},
+            )

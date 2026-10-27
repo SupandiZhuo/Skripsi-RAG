@@ -129,6 +129,26 @@ def test_document_id_is_deterministic():
     assert document_id(" SRV-001 ") == document_id("SRV-001")
 
 
+@pytest.mark.parametrize("flag", [True, False, "true", "false", "unknown"])
+def test_document_preserves_explicit_inventory_verification(flag):
+    row = dict(load_assets(str(V2_CSV))[0], inventory_verified=flag)
+    document = build_v2_document(row)
+    assert document.metadata["inventory_verified"] == flag
+    assert "Inventory completeness verified:" in document.page_content
+
+
+def test_csv_ingestion_preserves_inventory_verification_extension(tmp_path):
+    row = dict(load_assets(str(V2_CSV))[0], software_inventory_json="[]", inventory_verified="true")
+    csv_path = tmp_path / "inventory.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=V2_COLUMNS + ["software_inventory_json", "inventory_verified"])
+        writer.writeheader()
+        writer.writerow(row)
+    store = ingest(tmp_path / "isolated-chroma", csv_file=csv_path)
+    saved = store.get(ids=[document_id(row["asset_id"])], include=["metadatas"])
+    assert saved["metadatas"][0]["inventory_verified"] == "true"
+
+
 def test_ingested_ids_match_deterministic_ids(tmp_path):
     store = ingest(tmp_path)
     assert set(store.get()["ids"]) == set(expected_ids())

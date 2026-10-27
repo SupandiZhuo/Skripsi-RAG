@@ -1,8 +1,9 @@
-streamlit>=1.30.0
-pandas>=2.0.0
+streamlit>=1.66.1,<2
+pandas>=3.1.0,<4
 requests>=2.31.0
 cvss>=3.0
 langchain>=0.1.0
 langchain-chroma>=0.1.0
 langchain-huggingface>=0.0.1
 langchain-google-genai>=1.0.0
+pydantic>=2.0,<3

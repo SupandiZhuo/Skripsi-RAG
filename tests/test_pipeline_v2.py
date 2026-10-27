@@ -6,23 +6,23 @@ staying backward-compatible with v1 documents), the LLM prompt carries the
 schema-v2 baseline rules, and collection constants stay consistent with
 ingestion. No live LLM/NVD calls are made.
 
-Note: importing app executes the Streamlit script in bare mode (same as
-test_contextual_assessment) and loads the real v2 collection from ./chroma_db,
-which must have been ingested via `python ingest_assets.py --v2`. Run:
+The app loader is inspected via AST, never imported in bare Streamlit mode.
+Integration stores are ingested under tmp_path with dummy embeddings. Run:
 python -m pytest test_pipeline_v2.py -q
 """
 
+import ast
 from pathlib import Path
 
 from langchain_chroma import Chroma
 
-from app import load_vector_db
 from asset_schema_v2 import load_assets
 from ingest_assets import (
     COLLECTION_NAME,
     COLLECTION_NAME_V2,
     build_v2_document,
     document_id,
+    ingest_v2_to_chromadb,
 )
 from llm_assessment import TEMPLATE
 from rag_retrieval import CONTEXT_METADATA_FIELDS, filtered_metadata, retrieve_asset_context
@@ -51,16 +51,32 @@ def test_collection_constants_are_distinct():
 
 
 def test_app_vector_store_targets_v2_collection():
-    store = load_vector_db()
-    assert store._collection_name == COLLECTION_NAME_V2
-    assert store._collection_name != COLLECTION_NAME
+    tree = ast.parse((ROOT / "app.py").read_text(encoding="utf-8"))
+    loader = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "load_vector_db")
+    returns = [node.value for node in ast.walk(loader) if isinstance(node, ast.Return)]
+    assert len(returns) == 1
+    call = returns[0]
+    assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    assert call.func.id == "Chroma"
+    keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+    assert isinstance(keywords["collection_name"], ast.Name)
+    assert keywords["collection_name"].id == "COLLECTION_NAME_V2"
+    assert ast.literal_eval(keywords["create_collection_if_not_exists"]) is False
+    assert any(
+        isinstance(node, ast.ImportFrom) and node.module == "ingest_assets"
+        and any(alias.name == "COLLECTION_NAME_V2" and alias.asname is None for alias in node.names)
+        for node in tree.body
+    )
 
 
-def test_app_v2_collection_contains_ingested_assets():
-    store = load_vector_db()
+def test_temporary_v2_collection_contains_ingested_assets(tmp_path):
+    store = ingest_v2_to_chromadb(
+        csv_file=str(V2_CSV), collection_name=COLLECTION_NAME_V2,
+        persist_directory=str(tmp_path), embeddings=DummyEmbeddings(),
+    )
     ids = set(store.get()["ids"])
     assert "asset:SRV-001" in ids
-    assert {document_id(row["asset_id"]) for row in load_assets(str(V2_CSV))} <= ids
+    assert {document_id(row["asset_id"]) for row in load_assets(str(V2_CSV))} == ids
     assert all(doc_id.startswith("asset:") for doc_id in ids)
 
 
@@ -113,6 +129,7 @@ def test_retrieval_returns_v2_candidates_with_full_context(tmp_path):
 
     store = Chroma(
         collection_name=COLLECTION_NAME_V2,
+        collection_metadata={"hnsw:space": "cosine"},
         embedding_function=DummyEmbeddings(),
         persist_directory=str(tmp_path),
     )
@@ -124,6 +141,7 @@ def test_retrieval_returns_v2_candidates_with_full_context(tmp_path):
     assert len(result.candidates) == 3
     expected_asset_ids = {row["asset_id"] for row in rows}
     for candidate in result.candidates:
+        assert 0.0 <= candidate.confidence <= 1.0
         assert candidate.metadata["asset_id"] in expected_asset_ids
         context = filtered_metadata(candidate.metadata)
         assert "confidentiality_requirement" in context
@@ -134,9 +152,11 @@ def test_retrieval_returns_v2_candidates_with_full_context(tmp_path):
 # ---------------------------------------------------------------------------
 # 4. LLM prompt carries schema-v2 baseline rules
 # ---------------------------------------------------------------------------
-def test_prompt_carries_schema_v2_baseline_rules():
-    assert "Asset Schema v2" in TEMPLATE
-    assert "baseline organisasi" in TEMPLATE
+def test_prompt_excludes_baseline_labels_and_requires_independent_evidence():
+    assert "excludes stored baseline and expert CR/IR/AR labels" in TEMPLATE
+    assert "Infer CR, IR, and AR independently" in TEMPLATE
+    assert "Use X for each unsupported requirement" in TEMPLATE
+    assert "Every non-X metric requires evidence" in TEMPLATE
     assert "unknown" in TEMPLATE
     assert "MAV" in TEMPLATE
     assert "is_synthetic" in TEMPLATE

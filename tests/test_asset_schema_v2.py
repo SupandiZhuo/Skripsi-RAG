@@ -212,3 +212,29 @@ def test_missing_file_reported():
     errors = validate_csv(str(ROOT / "data" / "does_not_exist.csv"))
     assert len(errors) == 1
     assert "file not found" in errors[0]
+
+
+def test_optional_inventory_completeness_column_round_trip(tmp_path):
+    path = tmp_path / "extended_inventory.csv"
+    header = V2_COLUMNS + ["inventory_verified"]
+    row = valid_row() | {"inventory_verified": "false"}
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=header)
+        writer.writeheader()
+        writer.writerow(row)
+    assert validate_csv(str(path)) == []
+    assert load_assets(str(path))[0]["inventory_verified"] == "false"
+
+
+def test_inventory_completeness_flag_is_not_truthy_coercion():
+    for value in (True, False, "true", "false", "unknown", ""):
+        assert validate_row(valid_row() | {"inventory_verified": value}) == []
+    for value in ("yes", "True", 1, "0"):
+        assert any("inventory_verified" in error for error in validate_row(valid_row() | {"inventory_verified": value}))
+
+
+def test_schema_cpe_uses_shared_strict_parser():
+    row = valid_row() | {"cpe": "cpe:2.3:a:example:app:1.2"}
+    assert any("cpe" in error for error in validate_row(row))
+    row["cpe"] = r"cpe:2.3:a:ex\:ample:app:1.2:*:*:*:*:*:*:*"
+    assert validate_row(row) == []
