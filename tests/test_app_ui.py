@@ -2,11 +2,14 @@
 
 from dataclasses import asdict
 import hashlib
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from streamlit.testing.v1 import AppTest
+from test_va_import import csv_bytes, finding
 
 
 ASSETS = [
@@ -119,7 +122,7 @@ class _FakeVectorStore:
 
 
 def _patch_streamlit_dependencies(monkeypatch):
-    import assessment_history
+    from skripsi_rag import assessment_history
     import langchain_chroma
     import langchain_huggingface
     import streamlit as st
@@ -127,7 +130,7 @@ def _patch_streamlit_dependencies(monkeypatch):
     monkeypatch.setattr(langchain_chroma, "Chroma", _FakeVectorStore)
     monkeypatch.setattr(langchain_huggingface, "HuggingFaceEmbeddings", _FakeEmbeddings)
     history = []
-    monkeypatch.setattr(assessment_history, "load_history", lambda: list(history))
+    monkeypatch.setattr(assessment_history, "load_history", lambda **kwargs: list(history))
     monkeypatch.setattr(assessment_history, "save_assessment", history.append)
     monkeypatch.setattr(assessment_history, "delete_record", lambda record: history.remove(record))
     _FakeVectorStore.instances = {}
@@ -172,7 +175,8 @@ def test_navigation_has_exactly_three_pages_and_defaults_to_analysis(monkeypatch
         "Analysis History",
     ]
     assert app.session_state["nav_page"] == "Vulnerability Analysis"
-    assert app.checkbox(key="cloud_consent").value is False
+    assert app.get("file_uploader")
+    assert not any(element.key == "cve_input" for element in app.text_input)
     assert app.text_input(key="gemini_model").value
     assert any("Settings" in expander.label for expander in app.expander)
 
@@ -202,6 +206,23 @@ def test_asset_edit_persists_metadata_without_changing_stable_id(monkeypatch):
     assert stored["asset_id"] == "SRV-002"
 
 
+@pytest.mark.parametrize("inventory", ['{"unreadable inventory":', '[{"cpe":"unknown"}]'])
+def test_metadata_edit_preserves_inventory_that_cannot_be_edited(monkeypatch, inventory):
+    monkeypatch.setitem(ASSETS[1], "software_inventory_json", inventory)
+    monkeypatch.setitem(ASSETS[1], "cpe", "unknown")
+    app = _app_test(monkeypatch, "Asset Inventory").run(timeout=60)
+    app.selectbox(key="inventory_asset_select").select("SRV-002").run(timeout=60)
+    assert any("Software inventory could not be loaded" in error.value for error in app.error)
+    assert not any(button.key == "sw_save_SRV-002" for button in app.button)
+    app.text_input(key="am_name_SRV-002").set_value("Edited without replacing inventory")
+    next(button for button in app.button if button.label == "Save changes").click().run(timeout=60)
+    assert not app.exception
+    stored = _FakeVectorStore.instances["corporate_assets_v2"].records["SRV-002"]
+    assert stored["asset_name"] == "Edited without replacing inventory"
+    assert stored["software_inventory_json"] == inventory
+    assert stored["cpe"] == "unknown"
+
+
 def test_inventory_analysis_action_preselects_stable_asset_id(monkeypatch):
     app = _app_test(monkeypatch, "Asset Inventory").run(timeout=60)
     app.selectbox(key="inventory_asset_select").select("SRV-002").run(timeout=60)
@@ -222,8 +243,35 @@ def test_software_inventory_verification_is_explicit_and_persisted(monkeypatch):
     assert _FakeVectorStore.last_instance.records["SRV-002"]["inventory_verified"] == "true"
 
 
+def test_unverified_unknown_cpe_can_be_saved_without_losing_source_metadata(monkeypatch):
+    item = {"name": "PostgreSQL", "software_name": "PostgreSQL", "version": "16",
+            "software_version": "16", "cpe": "unknown", "source_reference": "Test questionnaire"}
+    monkeypatch.setitem(ASSETS[1], "software_inventory_json", json.dumps([item]))
+    monkeypatch.setitem(ASSETS[1], "is_synthetic", "true")
+    app = _app_test(monkeypatch, "Asset Inventory").run(timeout=60)
+    app.selectbox(key="inventory_asset_select").select("SRV-002").run(timeout=60)
+    assert any("synthetic/demo" in warning.value for warning in app.warning)
+    app.button(key="sw_save_SRV-002").click().run(timeout=60)
+    assert not app.exception
+    metadata = _FakeVectorStore.instances["corporate_assets_v2"].records["SRV-002"]
+    assert json.loads(metadata["software_inventory_json"]) == [item]
+    assert metadata["inventory_verified"] == "false"
+
+
+def test_unknown_cpe_does_not_allow_complete_inventory_verification(monkeypatch):
+    monkeypatch.setitem(ASSETS[1], "software_inventory_json", json.dumps([
+        {"name": "PostgreSQL", "version": "16", "cpe": "unknown"}]))
+    app = _app_test(monkeypatch, "Asset Inventory").run(timeout=60)
+    app.selectbox(key="inventory_asset_select").select("SRV-002").run(timeout=60)
+    app.checkbox(key="sw_verified_SRV-002").check().run(timeout=60)
+    app.button(key="sw_save_SRV-002").click().run(timeout=60)
+    assert not app.exception
+    assert any("valid CPE for each" in error.value for error in app.error)
+    assert _FakeVectorStore.instances["corporate_assets_v2"].records["SRV-002"].get("inventory_verified") != "true"
+
+
 def _document_fixture(asset_id):
-    from rag_retrieval import context_chunk_id
+    from skripsi_rag.rag_retrieval import context_chunk_id
 
     content = f"Operational note for {asset_id}: public portal availability supports business operations."
     metadata = {
@@ -236,10 +284,10 @@ def _document_fixture(asset_id):
     return SimpleNamespace(page_content=content, metadata=metadata)
 
 
-def _ready_analysis(monkeypatch, justification="Assessment uses selected asset evidence."):
-    import llm_assessment
-    import nvd_client
-    from llm_assessment import ContextualAssessment
+def _ready_analysis(monkeypatch, justification="Assessment uses selected asset evidence.", configurations=None):
+    from skripsi_rag import llm_assessment
+    from skripsi_rag import nvd_client
+    from skripsi_rag.llm_assessment import ContextualAssessment
 
     history = _patch_streamlit_dependencies(monkeypatch)
     calls = {"nvd": [], "model": []}
@@ -249,11 +297,12 @@ def _ready_analysis(monkeypatch, justification="Assessment uses selected asset e
         return {
             "cve_id": cve_id, "description": "Test vulnerability description.",
             "base_score": 9.8, "vector_string": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-            "configurations": [], "nvd_snapshot_id": "fixture-snapshot",
+            "configurations": configurations or [], "nvd_snapshot_id": "fixture-snapshot",
             "nvd_cvss_source": "nvd@nist.gov", "cvss_version": "3.1",
         }, "Fixture NVD snapshot"
 
-    def analyze(api_key, description, vector, context, model):
+    def analyze(api_key, cve_desc, original_vector, asset_context, model):
+        description, vector, context = cve_desc, original_vector, asset_context
         calls["model"].append({"description": description, "vector": vector, "context": context, "model": model})
         evidence_id = context["retrieved_evidence"][0]["evidence_id"] if context["retrieved_evidence"] else context["asset_evidence_id"]
         return ContextualAssessment.model_validate({
@@ -266,11 +315,16 @@ def _ready_analysis(monkeypatch, justification="Assessment uses selected asset e
 
     monkeypatch.setattr(nvd_client, "fetch_cve_from_nvd", fetch)
     monkeypatch.setattr(llm_assessment, "analyze_with_llm", analyze)
+    from skripsi_rag import pipeline
+    monkeypatch.setattr(pipeline, "analyze_with_llm", analyze)
+    uploaded = io.BytesIO(csv_bytes([finding(CVEList="CVE-2021-44228")]))
+    uploaded.name = "synthetic-va.csv"
+    import streamlit as st
+    monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: uploaded)
     app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=60)
     app.session_state["analysis_asset_preselect"] = "SRV-002"
     app.run(timeout=60)
     app.text_input(key="gemini_api_key").set_value("test-key").run(timeout=60)
-    app.text_input(key="cve_input").set_value("CVE-2021-44228")
     return app, calls, history
 
 
@@ -297,14 +351,16 @@ def test_analysis_uses_selected_asset_document_evidence_and_keeps_result_on_reru
     assert context["retrieved_evidence"][0]["metadata"]["asset_id"] == "SRV-002"
     assert record.evidence["model_context"] == context
     assert record.provenance["model_input"]["asset_context"] == context
-    assert record.provenance["nvd"]["nvd_snapshot_id"] == "fixture-snapshot"
+    assert record.provenance["assessment"]["nvd_snapshot_id"] == "fixture-snapshot"
+    assert record.provenance["source"] == "Acunetix CSV"
+    assert record.evidence["scanner_finding"]["cve_ids"] == ["CVE-2021-44228"]
     assert record.model_output["metric_reasons"]["CR"]["evidence_ids"]
     assert "test-key" not in json.dumps(asdict(record))
     store = _FakeVectorStore.instances["organizational_context"]
     assert store.search_calls[0]["filter"] == {"asset_id": "SRV-002"}
     assert record.evidence["document_retrieval"]["rejected"][0]["rejection_reason"] == "asset_id_mismatch"
     assert app.button(key="new_analysis")
-    # A normal rerun must preserve the assessment; theme is client-controlled.
+    # Reruns must preserve results without making another model call.
     app.run(timeout=60)
     assert not app.exception
     assert app.session_state["analysis_result"]["cve_id"] == "CVE-2021-44228"
@@ -349,13 +405,105 @@ def test_no_accepted_document_evidence_is_explicit_and_not_substituted(monkeypat
     assert any("No accepted document evidence" in warning.value for warning in app.warning)
 
 
-def test_cve_id_is_not_silently_normalized(monkeypatch):
+def test_unmapped_target_is_retained_without_external_calls(monkeypatch):
     app, calls, _ = _ready_analysis(monkeypatch)
-    app.text_input(key="cve_input").set_value(" cve-2021-44228 ")
-    _submit_analysis(app)
+    app.selectbox(key="analysis_asset_select").select("")
+    next(button for button in app.button if button.label == "Run Analysis").click().run(timeout=60)
     assert not app.exception
     assert not calls["nvd"] and not calls["model"]
-    assert any("literal CVE ID" in error.value for error in app.error)
+    assert app.session_state["va_batch"]["cases"][0]["status"] == "unmapped_asset"
+
+
+def test_upload_change_clears_results_and_requires_new_consent(monkeypatch):
+    app, calls, _ = _ready_analysis(monkeypatch)
+    _submit_analysis(app)
+    import streamlit as st
+    uploaded = io.BytesIO(csv_bytes([finding(CVEList='""')]))
+    uploaded.name = "other-report.csv"
+    monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: uploaded)
+    app.run(timeout=60)
+    assert not app.exception
+    assert app.session_state["va_batch"] is None
+    assert not app.checkbox(key="cloud_consent").value
+    assert app.selectbox(key="analysis_asset_select").value == ""
+    assert len(calls["model"]) == 1
+
+
+def test_confirmed_applicability_produces_separate_deterministic_priority(monkeypatch):
+    configs = [{"nodes": [{"operator": "OR", "cpeMatch": [{"vulnerable": True,
+        "criteria": ASSETS[1]["cpe"]}]}]}]
+    app, calls, _ = _ready_analysis(monkeypatch, configurations=configs)
+    _submit_analysis(app)
+    assert not app.exception
+    case = app.session_state["va_batch"]["cases"][0]
+    assert case["status"] == "complete"
+    assert case["assessment"]["applicability"]["status"] == "Confirmed"
+    assert case["assessment"]["deterministic_priority"] in {"P1", "P2", "P3", "P4"}
+    assert case["assessment"]["technical_severity"] == "Critical"
+    assert len(calls["model"]) == 1
+
+
+def test_locations_export_is_rejected_before_any_external_call(monkeypatch):
+    app, calls, _ = _ready_analysis(monkeypatch)
+    import streamlit as st
+    uploaded = io.BytesIO(b"Name,URL,FullURL,Inputs (Name:Type)\na,b,c,d\n")
+    uploaded.name = "locations.csv"
+    monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: uploaded)
+    app.run(timeout=60)
+    assert not app.exception
+    assert any("Locations export" in error.value for error in app.error)
+    assert not calls["nvd"] and not calls["model"]
+
+
+def test_cveless_report_keeps_scanner_recommendations_without_cloud_calls(monkeypatch):
+    app, calls, _ = _ready_analysis(monkeypatch)
+    import streamlit as st
+    uploaded = io.BytesIO(csv_bytes([finding(CVEList='""', Recommendation="Set a restrictive policy.")],
+        headers=list(finding()) + ["Recommendation"]))
+    uploaded.name = "no-cve.csv"
+    monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: uploaded)
+    app.run(timeout=60)
+    app.text_input(key="gemini_api_key").set_value("")
+    next(button for button in app.button if button.label == "Run Analysis").click().run(timeout=60)
+    assert not app.exception
+    assert not calls["nvd"] and not calls["model"]
+    assert app.session_state["va_batch"]["cases"][0]["status"] == "no_cve"
+    assert any(element.value == "Set a restrictive policy." for element in app.markdown)
+    assert len(app.get("download_button")) == 2
+
+
+def test_scanner_inventory_conflict_is_reviewable_without_model_inference(monkeypatch):
+    configs = [{"nodes": [{"operator": "OR", "cpeMatch": [{"vulnerable": True,
+        "criteria": "cpe:2.3:a:other:product:1.0:*:*:*:*:*:*:*"}]}]}]
+    app, calls, _ = _ready_analysis(monkeypatch, configurations=configs)
+    _FakeVectorStore.instances["corporate_assets_v2"].records["SRV-002"]["inventory_verified"] = True
+    _submit_analysis(app)
+    assert not app.exception
+    case = app.session_state["va_batch"]["cases"][0]
+    assert case["status"] == "scanner_inventory_conflict"
+    assert case["assessment"]["deterministic_priority"] is None
+    assert not calls["model"]
+    assert app.session_state["analysis_record"].provenance["case_status"] == "scanner_inventory_conflict"
+    assert any("conflict" in warning.value for warning in app.warning)
+    assert any("CR/IR/AR have not been assigned" in info.value for info in app.info)
+
+
+def test_multiple_targets_need_individual_mapping_and_show_import_diagnostics(monkeypatch):
+    app, calls, _ = _ready_analysis(monkeypatch)
+    import streamlit as st
+    uploaded = io.BytesIO(csv_bytes([finding(), finding(Target="https://second.example.test"), ["bad", "row"]]))
+    uploaded.name = "multi.csv"
+    monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: uploaded)
+    app.run(timeout=60)
+    assert not app.exception
+    mapping = [select for select in app.selectbox if select.key.startswith("va_map_")]
+    assert len(mapping) == 3
+    assert all(select.value == "" for select in mapping)
+    assert any("Import diagnostics" in exp.label for exp in app.expander)
+    next(button for button in app.button if button.label == "Run Analysis").click().run(timeout=60)
+    assert not app.exception
+    assert not calls["nvd"] and not calls["model"]
+    assert len(app.session_state["va_batch"]["cases"]) == 3
 
 
 def test_inventory_search_filters_real_records_and_add_rejects_duplicate(monkeypatch):
@@ -406,3 +554,37 @@ def test_history_table_separates_priority_applicability_and_supports_delete(monk
     next(button for button in app.button if button.label == "Delete").click().run(timeout=60)
     assert not app.exception
     assert not history
+
+
+def test_history_read_failure_is_visible_instead_of_an_empty_state(monkeypatch):
+    from skripsi_rag import assessment_history
+
+    app = _app_test(monkeypatch, "Analysis History")
+
+    def fail_read(**kwargs):
+        raise assessment_history.HistoryReadError("Synthetic invalid history")
+
+    monkeypatch.setattr(assessment_history, "load_history", fail_read)
+    app.run(timeout=60)
+    assert not app.exception
+    assert any("History could not be loaded" in error.value for error in app.error)
+    assert not any("No assessments recorded" in info.value for info in app.info)
+
+
+def test_history_delete_failure_keeps_the_record_and_shows_feedback(monkeypatch):
+    from skripsi_rag import assessment_history
+
+    app, _, history = _ready_analysis(monkeypatch)
+    _submit_analysis(app)
+    app.button(key="save_analysis").click().run(timeout=60)
+    app.radio[0].set_value("Analysis History").run(timeout=60)
+
+    def fail_delete(record):
+        raise OSError("Synthetic file write failure")
+
+    monkeypatch.setattr(assessment_history, "delete_record", fail_delete)
+    app.run(timeout=60)
+    next(button for button in app.button if button.label == "Delete").click().run(timeout=60)
+    assert not app.exception
+    assert len(history) == 1
+    assert any("History delete failed" in error.value for error in app.error)

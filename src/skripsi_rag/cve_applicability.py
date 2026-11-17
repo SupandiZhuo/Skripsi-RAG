@@ -60,8 +60,7 @@ def _normalize_cpes(asset_cpes: Union[None, str, Iterable[str]]) -> List[str]:
         return [p.strip() for p in parts if p.strip()]
     if not isinstance(asset_cpes, Iterable) or isinstance(asset_cpes, Mapping):
         return ["invalid_inventory"]
-    # Do not discard invalid/unknown members of an otherwise valid inventory:
-    # doing so could turn a verified non-match into an unsupported exclusion.
+    # Keep invalid entries so incomplete inventory cannot support a negative result.
     return [str(c).strip() for c in asset_cpes]
 
 
@@ -234,7 +233,6 @@ def _build_evidence(
     return ev
 
 
-# Three-valued logic helpers --------------------------------------------------
 def _kleene_and(values: List[Optional[bool]]) -> Optional[bool]:
     if any(v is False for v in values):
         return False
@@ -270,7 +268,6 @@ def _kleene_combine(values: List[Optional[bool]], operator: str) -> Optional[boo
     return None
 
 
-# Match evaluation ------------------------------------------------------------
 def _evaluate_match_for_asset(
     asset_cpe: str,
     match: Mapping[str, Any],
@@ -312,8 +309,8 @@ def _evaluate_match_for_asset(
         "versionEndIncluding", "versionEndExcluding",
     ))
 
-    # Exact identifiers do not require vendor-specific version ordering. For
-    # differing numeric representations preserve the existing dotted comparator.
+    # Compare exact version identifiers before applying numeric ordering.
+    # Numeric representations still use the dotted-version comparator.
     if crit_version == "*":
         exact_result = True
     elif version == "*":
@@ -381,7 +378,7 @@ def _evaluate_match_against_assets(
             has_true = True
         elif res is None:
             has_unknown = True
-        # res is False -> condition unsatisfied for this asset, no flag needed
+        # A non-match cannot cancel another installed product's match.
     if has_true:
         return True, evidence
     if has_unknown:
@@ -393,7 +390,6 @@ def _evaluate_match_against_assets(
     return False, evidence
 
 
-# Node / configuration evaluation ---------------------------------------------
 @dataclass
 class _Condition:
     matched: Optional[bool]
@@ -407,8 +403,7 @@ def _unknown_condition(path: str, reason: str) -> _Condition:
 
 def _combine_conditions(results: List[_Condition], operator: Any, negate: Any, path: str) -> _Condition:
     evidence = [entry for result in results for entry in result.evidence]
-    # No arbitrary AND/OR default for ambiguous containers. Native single-node
-    # configurations work without an operator because there is no combination.
+    # Single-node configurations need no operator; ambiguous containers stay Unknown.
     if operator is None and len(results) == 1:
         operator = "OR"
     if not results or operator not in ("AND", "OR") or type(negate) is not bool:
@@ -542,7 +537,6 @@ def determine_applicability(
     )
 
 
-# Convenience predicate kept for callers that only need a boolean-like answer.
 def cpe_matches(asset_cpe: str, criteria_cpe: str) -> bool:
     """Return True when `asset_cpe` matches `criteria_cpe` (CPE 2.3).
 

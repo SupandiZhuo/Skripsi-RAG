@@ -1,9 +1,9 @@
-"""Targeted checks for the editable Asset Inventory (Phase B1).
+"""Software inventory serialization, validation and Chroma persistence checks.
 
 Covers: software inventory serialization, CPE validation, CPE collection from
 legacy + inventory fields, and ChromaDB metadata update/persistence.
 Integration tests ingest fresh temporary collections with dummy embeddings.
-Run: python -m pytest test_asset_inventory.py -q
+Run: python -m pytest tests/test_asset_inventory.py -q
 """
 
 from pathlib import Path
@@ -11,25 +11,22 @@ from pathlib import Path
 import pytest
 from langchain_chroma import Chroma
 
-from ingest_assets import COLLECTION_NAME, COLLECTION_NAME_V2, ingest_v2_to_chromadb
+from skripsi_rag.ingest_assets import COLLECTION_NAME, COLLECTION_NAME_V2, ingest_v2_to_chromadb
 from test_ingest_assets_v2 import DummyEmbeddings
-from asset_inventory import (
+from skripsi_rag.asset_inventory import (
     SOFTWARE_INVENTORY_FIELD,
     collect_asset_cpes,
     is_valid_cpe,
     load_software_inventory,
     save_software_inventory,
 )
-from rag_retrieval import (
+from skripsi_rag.rag_retrieval import (
     get_asset_by_id,
     list_all_assets,
     update_asset_metadata,
 )
 
 
-# ---------------------------------------------------------------------------
-# Software inventory serialization
-# ---------------------------------------------------------------------------
 def test_load_software_inventory_empty_when_missing():
     assert load_software_inventory({}) == []
     assert load_software_inventory({SOFTWARE_INVENTORY_FIELD: ""}) == []
@@ -50,9 +47,18 @@ def test_load_software_inventory_skips_malformed_json():
     assert load_software_inventory({SOFTWARE_INVENTORY_FIELD: "not-json"}) == []
 
 
-# ---------------------------------------------------------------------------
-# CPE validation and collection
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("raw", ["not-json", "{}", '[{"name":"valid"}, null]', 7])
+def test_strict_inventory_loading_rejects_discarded_data(raw):
+    with pytest.raises(ValueError, match="Software inventory"):
+        load_software_inventory({SOFTWARE_INVENTORY_FIELD: raw}, strict=True)
+
+
+def test_strict_inventory_loading_preserves_unknown_fields():
+    record = {"name": "PostgreSQL", "version": "16", "cpe": "unknown", "source_reference": "Synthetic source"}
+    asset = {SOFTWARE_INVENTORY_FIELD: save_software_inventory([record])}
+    assert load_software_inventory(asset, strict=True) == [record]
+
+
 def test_is_valid_cpe_accepts_cpe_2_3():
     assert is_valid_cpe("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*")
     assert not is_valid_cpe("not-a-cpe")
@@ -94,13 +100,10 @@ def test_collect_asset_cpes_skips_invalid_and_unknown():
     assert cpes == ["cpe:2.3:a:vendor:product:2:*:*:*:*:*:*:*"]
 
 
-# ---------------------------------------------------------------------------
-# ChromaDB integration
-# ---------------------------------------------------------------------------
 @pytest.fixture
 def vector_store(tmp_path):
     return ingest_v2_to_chromadb(
-        csv_file=str(Path(__file__).resolve().parents[1] / "data" / "asset_data_v2.csv"),
+        csv_file=str(Path(__file__).resolve().parents[1] / "data" / "examples" / "asset_data_v2.csv"),
         collection_name=COLLECTION_NAME_V2,
         persist_directory=str(tmp_path),
         embeddings=DummyEmbeddings(),
@@ -133,7 +136,6 @@ def test_update_asset_metadata_persists_and_reflected_after_reopen(vector_store,
     updates = {"description": new_desc}
     assert update_asset_metadata(vector_store, "SRV-003", updates)
 
-    # Direct fetch should see the change.
     fetched = get_asset_by_id(vector_store, "SRV-003")
     assert fetched["description"] == new_desc
 
@@ -166,9 +168,6 @@ def test_collect_asset_cpes_from_temporary_asset_with_inventory(vector_store):
     assert "cpe:2.3:a:testvendor:testapp:1.0.0:*:*:*:*:*:*:*" in cpes
 
 
-# ---------------------------------------------------------------------------
-# Legacy collection preservation
-# ---------------------------------------------------------------------------
 def test_legacy_corporate_assets_collection_untouched(tmp_path):
     legacy = Chroma(
         collection_name=COLLECTION_NAME,
@@ -178,7 +177,7 @@ def test_legacy_corporate_assets_collection_untouched(tmp_path):
     legacy.add_texts(["Legacy fixture asset"], metadatas=[{"asset_id": "LEGACY-001"}], ids=["legacy:001"])
     before = legacy.get(include=["metadatas", "documents", "embeddings"])
     current = ingest_v2_to_chromadb(
-        csv_file=str(Path(__file__).resolve().parents[1] / "data" / "asset_data_v2.csv"),
+        csv_file=str(Path(__file__).resolve().parents[1] / "data" / "examples" / "asset_data_v2.csv"),
         persist_directory=str(tmp_path), collection_name=COLLECTION_NAME_V2,
         embeddings=DummyEmbeddings(),
     )

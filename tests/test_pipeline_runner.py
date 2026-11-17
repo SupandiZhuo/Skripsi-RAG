@@ -4,14 +4,40 @@ from unittest.mock import Mock
 
 import pytest
 
-from pipeline import run_assessment
-from llm_assessment import ContextualAssessment
+from skripsi_rag.pipeline import run_assessment
+from skripsi_rag.llm_assessment import ContextualAssessment
 
 BASE = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
 NVD = {"cve_id": "CVE-2024-1234", "description": "Unit description", "base_score": 9.8,
        "vector_string": BASE, "configurations": [], "vector_origin": "nvd"}
 ASSET = {"asset_id": "UNIT", "business_criticality": "High", "expert_labels": {"cr": "L"},
          "ground_truth": "H", "owner": "Private Person", "ip_address": "10.0.0.1"}
+
+
+def test_incomplete_inventory_does_not_authorize_negative_applicability():
+    asset = {**ASSET, "inventory_verified": True, "software_inventory_json": "not-json",
+             "cpe": "cpe:2.3:a:example:other:1.0:*:*:*:*:*:*:*"}
+    nvd = {**NVD, "configurations": [{"nodes": [{"operator": "OR", "cpeMatch": [
+        {"vulnerable": True, "criteria": "cpe:2.3:a:example:product:1.0:*:*:*:*:*:*:*"}]}]}]}
+    result = run_assessment(nvd, asset, experiment_id="E2", cloud_consent=True,
+                            analyzer=lambda **kwargs: prediction())
+    assert result["applicability"]["status"] == "Unknown"
+    assert result["deterministic_priority"] is None
+
+
+def test_default_business_query_and_explicit_experiment_override_are_auditable():
+    class Store:
+        def similarity_search_with_relevance_scores(self, query, **kwargs):
+            assert kwargs["filter"] == {"asset_id": "UNIT"}
+            return []
+
+    asset = {**ASSET, "business_function": "Pengelolaan pembayaran"}
+    for override in (None, "Frozen experimental query"):
+        result = run_assessment(NVD, asset, experiment_id="E3", cloud_consent=True,
+            context_store=Store(), retrieval_query=override, analyzer=lambda **kwargs: prediction(no_context=True))
+        actual = result["retrieval"]["query"]
+        assert actual == override if override is not None else "Pengelolaan pembayaran" in actual
+        assert "no_accepted_document_evidence" in result["warnings"]
 
 
 def prediction(no_context=False):
@@ -61,7 +87,7 @@ def test_e2_sanitizes_hidden_labels_and_personal_fields():
     assert "expert_labels" not in context
     assert "Private Person" not in context
     assert "10.0.0.1" not in context
-    assert result["deterministic_priority"] is None  # missing applicability stays Unknown
+    assert result["deterministic_priority"] is None  # Missing applicability must remain Unknown.
     assert result["status"] == "needs_verification"
 
 
@@ -99,7 +125,7 @@ def test_rejects_unsupported_experiment():
 
 @pytest.mark.parametrize("has_invented_citation", [False, True])
 def test_e1_real_analyze_boundary_accepts_no_context_but_rejects_fake_evidence(monkeypatch, has_invented_citation):
-    import llm_assessment
+    from skripsi_rag import llm_assessment
     from langchain_core.runnables import RunnableLambda
     seen = []
 
@@ -113,7 +139,7 @@ def test_e1_real_analyze_boundary_accepts_no_context_but_rejects_fake_evidence(m
     monkeypatch.setattr(llm_assessment, "_build_llm", lambda api_key, model: OfflineStructuredProvider())
     result = run_assessment(NVD, ASSET, experiment_id="E1", cloud_consent=True,
                             api_key="offline-fixture-not-a-real-key")
-    assert seen  # Exercises analyze_with_llm + actual prompt boundary, not injected analyzer.
+    assert seen  # Exercise the prompt adapter rather than injecting an assessment result.
     rendered = str(seen[0])
     assert "Private Person" not in rendered
     assert "asset:UNIT" not in rendered
@@ -130,7 +156,7 @@ def test_e1_real_analyze_boundary_accepts_no_context_but_rejects_fake_evidence(m
 def test_e3_records_verified_scoped_document_input():
     import hashlib
     from langchain_core.documents import Document
-    from rag_retrieval import context_chunk_id
+    from skripsi_rag.rag_retrieval import context_chunk_id
     content = "Unit service requires transaction integrity and documented recovery."
     metadata = {"asset_id": "UNIT", "source_id": "unit-source", "document_id": "unit-doc",
                 "chunk_index": 0, "source": "unit fixture", "source_reference": "unit:fixture",

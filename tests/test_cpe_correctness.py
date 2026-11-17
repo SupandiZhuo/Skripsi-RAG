@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from asset_inventory import collect_asset_cpes, inventory_is_verified, is_valid_cpe
-from cve_applicability import ApplicabilityStatus as Status
-from cve_applicability import cpe_matches, determine_applicability, parse_cpe
+from skripsi_rag.asset_inventory import collect_asset_cpes, inventory_is_verified, is_valid_cpe
+from skripsi_rag.cve_applicability import ApplicabilityStatus as Status
+from skripsi_rag.cve_applicability import cpe_matches, determine_applicability, parse_cpe
 
 
 APP = "cpe:2.3:a:example:app:1.2:*:*:*:*:*:*:*"

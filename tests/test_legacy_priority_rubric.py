@@ -1,4 +1,4 @@
-"""Targeted checks for the deterministic Organizational Priority rubric (Phase 2C).
+"""Legacy priority baseline weights and classification rules.
 
 Covers: high-criticality assets, internet-exposed assets, low-criticality
 internal assets, missing/unknown metadata (explicit incomplete state),
@@ -6,20 +6,20 @@ conflicting evidence, reproducibility, backward compatibility with v1-style
 metadata, and rubric design invariants (severity cap, score consistency).
 
 No live API calls, no LLM, no ChromaDB - the rubric is a pure function.
-Run: python -m pytest test_priority_rubric.py -q
+Run: python -m pytest tests/test_legacy_priority_rubric.py -q
 """
 
 import pytest
 
-from asset_schema_v2 import load_assets
-from priority_rubric import (
+from skripsi_rag.asset_schema_v2 import load_assets
+from skripsi_rag.legacy_priority_rubric import (
     MAX_SCORE,
     PRIORITY_LEVELS,
     calculate_organizational_priority,
 )
 
-# Asset contexts mirroring data/asset_data_v2.csv (Asset Schema v2).
-SRV_001 = {  # Payment Gateway Database: Restricted zone, Mission Critical
+# Fixtures mirror the synthetic v2 inventory.
+SRV_001 = {  # Payment database fixture.
     "asset_id": "SRV-001",
     "network_zone": "Restricted",
     "business_criticality": "Mission Critical",
@@ -30,7 +30,7 @@ SRV_001 = {  # Payment Gateway Database: Restricted zone, Mission Critical
     "integrity_requirement": "X",
     "availability_requirement": "X",
 }
-SRV_002 = {  # Corporate Web Portal: DMZ, High, Public, internet-facing
+SRV_002 = {  # Public web portal fixture.
     "asset_id": "SRV-002",
     "network_zone": "DMZ",
     "business_criticality": "High",
@@ -41,7 +41,7 @@ SRV_002 = {  # Corporate Web Portal: DMZ, High, Public, internet-facing
     "integrity_requirement": "X",
     "availability_requirement": "X",
 }
-SRV_003 = {  # Cafeteria menu: Internal, Low, exposure unknown
+SRV_003 = {  # Cafeteria menu fixture.
     "asset_id": "SRV-003",
     "network_zone": "Internal",
     "business_criticality": "Low",
@@ -49,7 +49,7 @@ SRV_003 = {  # Cafeteria menu: Internal, Low, exposure unknown
     "environment": "unknown",
     "internet_exposed": "unknown",
 }
-SRV_004 = {  # Active Directory DC: Restricted zone, Mission Critical
+SRV_004 = {  # Domain controller fixture.
     "asset_id": "SRV-004",
     "network_zone": "Restricted",
     "business_criticality": "Mission Critical",
@@ -63,9 +63,6 @@ def _points(result, factor):
     return next(c.points for c in result.rule_contributions if c.factor == factor)
 
 
-# ---------------------------------------------------------------------------
-# 1. High-criticality assets
-# ---------------------------------------------------------------------------
 def test_mission_critical_with_critical_vuln_is_p1():
     result = calculate_organizational_priority(SRV_001, 9.8)
     assert result.status == "complete"
@@ -85,9 +82,6 @@ def test_high_criticality_internet_exposed_with_high_vuln_is_p2():
     assert _points(result, "exposure") == 20
 
 
-# ---------------------------------------------------------------------------
-# 2. Internet-exposed assets
-# ---------------------------------------------------------------------------
 def test_internet_exposure_increases_priority_score():
     exposed = dict(SRV_002, internet_exposed="yes")
     unexposed = dict(SRV_002, internet_exposed="no")
@@ -104,14 +98,11 @@ def test_internet_exposure_increases_priority_score():
 def test_dmzone_zone_derives_partial_exposure_when_flag_unknown():
     result = calculate_organizational_priority(dict(SRV_002, internet_exposed="unknown"), 8.0)
     assert result.status == "complete"
-    assert _points(result, "exposure") == 12  # DMZ-derived, below explicit=yes
+    assert _points(result, "exposure") == 12  # Zone-derived exposure stays below explicit internet exposure.
     exposure = next(c for c in result.rule_contributions if c.factor == "exposure")
     assert "tersirat" in exposure.evidence_source
 
 
-# ---------------------------------------------------------------------------
-# 3. Low-criticality internal assets
-# ---------------------------------------------------------------------------
 def test_low_criticality_internal_medium_vuln_is_p4():
     result = calculate_organizational_priority(SRV_003, 5.0)
     assert result.status == "complete"
@@ -140,9 +131,6 @@ def test_low_severity_never_exceeds_p2_even_on_max_stakes_asset():
     assert result.priority == "P2"
 
 
-# ---------------------------------------------------------------------------
-# 4. Missing / unknown metadata -> explicit incomplete state
-# ---------------------------------------------------------------------------
 def test_empty_asset_context_is_incomplete_not_low_risk():
     result = calculate_organizational_priority({}, 9.8)
     assert result.status == "incomplete"
@@ -163,32 +151,26 @@ def test_missing_nvd_base_score_is_incomplete():
 
 def test_unknown_optional_factors_do_not_block_classification():
     result = calculate_organizational_priority(SRV_003, 5.0)
-    # environment + cia fields unknown/absent, but required factors known
+    # Missing optional fields must not block classification.
     assert result.status == "complete"
     assert "environment" in result.unknown_factors
     assert "cia_baseline" in result.unknown_factors
     assert result.priority == "P4"
 
 
-# ---------------------------------------------------------------------------
-# 5. Conflicting evidence
-# ---------------------------------------------------------------------------
 def test_conflicting_exposure_evidence_uses_higher_risk_and_records_conflict():
-    conflicting = dict(SRV_003, internet_exposed="yes")  # Internal zone + exposed=yes
+    conflicting = dict(SRV_003, internet_exposed="yes")  # Deliberately conflicting exposure evidence.
     result = calculate_organizational_priority(conflicting, 8.0)
     assert result.status == "complete"
-    assert _points(result, "exposure") == 20  # fail-safe: explicit yes wins
+    assert _points(result, "exposure") == 20  # Explicit exposure overrides the network-zone fallback.
     assert any("bertentangan" in c for c in result.conflicts)
     assert "bertentangan" in result.explanation
 
 
-# ---------------------------------------------------------------------------
-# 6. Reproducibility
-# ---------------------------------------------------------------------------
 def test_calculation_is_reproducible():
     first = calculate_organizational_priority(SRV_001, 9.8)
     second = calculate_organizational_priority(dict(SRV_001), 9.8)
-    assert first == second  # frozen dataclasses: full structural equality
+    assert first == second  # Compare all result fields, including contributions and missing evidence.
 
 
 def test_contributions_sum_to_score():
@@ -203,9 +185,6 @@ def test_priority_always_in_enum_or_none():
         assert result.priority is None or result.priority in PRIORITY_LEVELS
 
 
-# ---------------------------------------------------------------------------
-# 7. Backward compatibility
-# ---------------------------------------------------------------------------
 def test_v1_style_metadata_without_v2_fields_still_classifies():
     v1_context = {  # v1 asset_data.csv columns only
         "asset_id": "SRV-005",
@@ -225,7 +204,7 @@ def test_v1_style_metadata_without_v2_fields_still_classifies():
 
 
 def test_full_v2_dataset_classifies_deterministically():
-    assets = load_assets("data/asset_data_v2.csv")
+    assets = load_assets("data/examples/asset_data_v2.csv")
     expected = {
         "SRV-001": "P2",  # 27+30+0+8 = 65
         "SRV-002": "P2",  # 27+22+20+0 = 69
@@ -239,5 +218,4 @@ def test_full_v2_dataset_classifies_deterministically():
         result = calculate_organizational_priority(asset, 7.5)
         assert result.status == "complete", asset["asset_id"]
         assert result.priority == expected[asset["asset_id"]], asset["asset_id"]
-        # Reproducible on the same row
         assert result == calculate_organizational_priority(asset, 7.5)

@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def test_active_app_has_no_cytoscape_or_asset_graph_dependency():
-    source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "src/skripsi_rag/ui.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     imports = [node for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))]
     imported_modules = {
@@ -15,7 +15,7 @@ def test_active_app_has_no_cytoscape_or_asset_graph_dependency():
     }
     retired_graph_modules = {"asset_graph", "cytoscape", "streamlit_cytoscape", "pyvis"}
     assert not any(
-        module and module.split(".")[0] in retired_graph_modules
+        module and any(part in retired_graph_modules for part in module.split("."))
         for module in imported_modules
     )
     assert "render_cytoscape_html" not in source

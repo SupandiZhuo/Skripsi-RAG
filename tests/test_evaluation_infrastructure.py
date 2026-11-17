@@ -86,7 +86,7 @@ def test_offline_runner_writes_auditable_outputs_from_public_snapshot(tmp_path):
 
 def test_real_public_fixtures_are_attributed_and_distinct():
     from pathlib import Path
-    from nvd_client import load_nvd_snapshot
+    from skripsi_rag.nvd_client import load_nvd_snapshot
     fixture_dir = Path(__file__).parent / "fixtures" / "nvd"
     attribution = json.loads((fixture_dir / "source_metadata.json").read_text())
     assert len(attribution) == 5

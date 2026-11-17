@@ -1,4 +1,4 @@
-"""Targeted checks for Asset Knowledge Base Schema v2 (Phase 1).
+"""Asset Schema v2 validation and synthetic-inventory migration checks.
 
 Covers: v2 CSV validates cleanly, seven original assets retained, v1 fields
 migrated byte-identical, unknown values not fabricated, evidence-based
@@ -6,13 +6,13 @@ sample values, and validator error reporting (missing required field, bad
 enum, bad CVSS requirement code, duplicate asset_id, bad header).
 
 No ChromaDB or pipeline files are touched. Run:
-python -m pytest test_asset_schema_v2.py -q
+python -m pytest tests/test_asset_schema_v2.py -q
 """
 
 import csv
 from pathlib import Path
 
-from asset_schema_v2 import (
+from skripsi_rag.asset_schema_v2 import (
     V2_COLUMNS,
     load_assets,
     validate_csv,
@@ -20,8 +20,8 @@ from asset_schema_v2 import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-V1_CSV = ROOT / "asset_data.csv"
-V2_CSV = ROOT / "data" / "asset_data_v2.csv"
+V1_CSV = ROOT / "data" / "examples" / "asset_data_v1.csv"
+V2_CSV = ROOT / "data" / "examples" / "asset_data_v2.csv"
 
 V1_COLUMNS = [
     "asset_id",
@@ -62,9 +62,6 @@ def valid_row():
     }
 
 
-# ---------------------------------------------------------------------------
-# 1. Real dataset parses and validates
-# ---------------------------------------------------------------------------
 def test_v2_csv_passes_validation():
     assert validate_csv(str(V2_CSV)) == []
 
@@ -94,9 +91,6 @@ def test_v2_columns_are_superset_of_v1():
         assert column in V2_COLUMNS
 
 
-# ---------------------------------------------------------------------------
-# 2. Unknown information is not fabricated (evidence-based migration)
-# ---------------------------------------------------------------------------
 def test_unknown_fields_not_fabricated():
     rows = {row["asset_id"]: row for row in read_v2_rows()}
     for asset_id in ("SRV-003", "SRV-004", "SRV-005", "SRV-007"):
@@ -117,7 +111,7 @@ def test_evidence_based_values_only():
     assert rows["SRV-001"]["internet_exposed"] == "no"   # "terisolasi dari internet"
     assert rows["SRV-002"]["internet_exposed"] == "yes"  # "menghadap ... internet publik"
     assert rows["SRV-006"]["software_name"] == "WordPress"  # "Server CMS WordPress"
-    # Nothing else inferred: no version/CPE anywhere.
+    # Missing software versions and CPEs must remain unknown.
     for row in rows.values():
         assert row["software_version"] == "unknown"
         assert row["cpe"] == "unknown"
@@ -131,9 +125,6 @@ def test_rows_flagged_as_synthetic():
         assert row["schema_version"] == "2.0"
 
 
-# ---------------------------------------------------------------------------
-# 3. Validator error reporting
-# ---------------------------------------------------------------------------
 def test_valid_template_row_has_no_errors():
     assert validate_row(valid_row(), row_number=2) == []
 
@@ -154,7 +145,7 @@ def test_invalid_enum_value_rejected_with_expected_values():
     errors = validate_row(row, row_number=3)
     assert len(errors) == 1
     assert "'business_criticality'" in errors[0]
-    assert "Mission Critical" in errors[0]  # allowed values shown
+    assert "Mission Critical" in errors[0]  # Validation errors list the allowed categories.
 
 
 def test_invalid_cia_code_rejected():
@@ -185,7 +176,7 @@ def test_invalid_schema_version_rejected():
 def test_wrong_header_rejected(tmp_path):
     bad = tmp_path / "bad_header.csv"
     rows = read_v2_rows()
-    header = [c for c in V2_COLUMNS if c != "vendor"]  # dropped column
+    header = [c for c in V2_COLUMNS if c != "vendor"]  # Missing columns must fail schema validation.
     with open(bad, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(header)
@@ -203,7 +194,7 @@ def test_duplicate_asset_id_rejected(tmp_path):
         writer.writerow(V2_COLUMNS)
         for row in rows:
             writer.writerow([row[c] for c in V2_COLUMNS])
-        writer.writerow([rows[0][c] for c in V2_COLUMNS])  # duplicate SRV-001
+        writer.writerow([rows[0][c] for c in V2_COLUMNS])  # Asset IDs must be unique within an inventory.
     errors = validate_csv(str(dup))
     assert any("duplicate asset_id" in e for e in errors)
 

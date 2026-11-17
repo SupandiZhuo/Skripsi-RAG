@@ -1,64 +1,22 @@
-"""LEGACY / BASELINE ONLY — Phase 2C priority rubric (inactive).
+"""Legacy priority policy for baseline comparisons, without a CPE applicability gate.
 
-The active application policy is organizational_priority.py, documented in
-docs/PRIORITY_RUBRIC.md. This historical implementation is retained solely
-for baseline comparisons and compatibility; its weights/thresholds and
-missing-evidence gates MUST NOT be described as the active algorithm.
-The policy below describes the legacy baseline only.
+Use organizational_priority.py for active remediation decisions. This baseline
+bands an existing NVD score and does not calculate CVSS or change its vector.
 
-Deterministic organizational remediation-priority rubric (Phase 2C).
+Policy points (maximum 100):
+- Severity: Critical 35, High 27, Medium 14, Low 4.
+- Business criticality: Mission Critical 30, High 22, Medium 11, Low 3.
+- Exposure: explicit internet exposure 20, derived DMZ exposure 12,
+  internal/restricted exposure 0.
+- Sensitivity: Restricted 8, Confidential 5, Internal 2, Public 0.
+- Production environment: 5.
+- Any declared high CIA baseline: 2.
 
-Computes Organizational Priority (P1-P4) from verified evidence only:
-- Organizational asset context (Asset Schema v2 fields retrieved via RAG).
-- The NVD CVSS v3.1 base score (technical baseline; banding only - the CVSS
-  formulas themselves are never modified or recomputed here).
-
-This is intentionally SEPARATE from CVSS Base/Threat/Environmental scoring:
-CVSS severity answers "how technically severe is the vulnerability", while
-this rubric answers "in what order should THIS organization remediate it",
-combining technical severity with asset criticality, exposure, data
-sensitivity, environment, and declared CIA baselines.
-
-Responsibility boundary (do not blur):
-- The rubric NEVER modifies a CVSS vector or score (see app.build_environmental_vector
-  and the `cvss` library for that).
-- The rubric NEVER invents missing attributes: unknown/absent evidence is
-  surfaced explicitly (`unknown_factors`) and, when a required factor is
-  unknown, the result is an explicit incomplete state (priority=None,
-  status="incomplete") instead of a silently low priority.
-- The LLM's organizational_priority (llm_assessment.ContextualAssessment) is
-  preserved unchanged as a model suggestion; this module is the deterministic
-  counterpart used for reproducible/defensible results and later evaluation.
-
-Legacy rubric (max 100 points; not the active documented policy):
-
-  Factor                  Points                              Kind
-  ----------------------  ----------------------------------  --------
-  vulnerability_severity  Critical=35 High=27 Medium=14 Low=4 required
-  business_criticality    MissionCritical=30 High=22         required
-                          Medium=11 Low=3
-  exposure                internet yes=20; zone DMZ=12;      required
-                          internal/restricted=0
-  data_sensitivity        Restricted=8 Confidential=5        optional
-                          Internal=2 Public=0
-  environment             production=5 (staging/dev=0)       optional
-  cia_baseline            any declared CR/IR/AR = H -> 2     optional
-
-  Thresholds: P1 >= 70 | P2 >= 50 | P3 >= 30 | P4 < 30
-
-Design properties (tested):
-- vulnerability_severity is capped at 35 (< 50% of max): a vulnerability can
-  never reach P1 on technical severity alone; P1 requires organizational
-  co-evidence (e.g. Mission Critical + Restricted data, or High criticality
-  + internet exposure).
-- A Low-severity vulnerability can never exceed P2 even on the highest-stakes
-  asset (max 4+30+20+8+5+2 = 69 < 70).
-- Conflicting evidence (e.g. internet_exposed=yes on an Internal zone) never
-  silently downgrades risk: the higher-risk interpretation is used and the
-  conflict is recorded.
-
-Stdlib-only (like asset_schema_v2.py) so the rubric is reusable by evaluation
-scripts and testable without Streamlit/LLM/ChromaDB dependencies.
+Thresholds are P1 >= 70, P2 >= 50, P3 >= 30, otherwise P4. Missing required
+factors produce an incomplete result; unknown optional factors are disclosed.
+Explicit exposure overrides a conflicting network zone and records the conflict.
+A Low-severity finding cannot exceed P2 under these weights. These are research
+baseline rules, not an expert-validated organizational policy.
 """
 
 from dataclasses import dataclass
@@ -67,16 +25,13 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 MAX_SCORE = 100
 PRIORITY_LEVELS: Tuple[str, ...] = ("P1", "P2", "P3", "P4")
 
-# (minimum_score, priority) evaluated in order; below the last threshold -> P4.
+# Evaluate thresholds top-down; scores below the last threshold map to P4.
 SCORE_THRESHOLDS: Tuple[Tuple[int, str], ...] = ((70, "P1"), (50, "P2"), (30, "P3"))
 
-# CVSS v3.1 qualitative severity rating scale (FIRST), banded from the NVD
-# base score. Used only to bucket an already-computed NVD score - no CVSS
-# math happens in this module.
+# FIRST severity bands bucket the NVD score; this module does not calculate CVSS.
 _SEVERITY_POINTS: Dict[str, int] = {"Critical": 35, "High": 27, "Medium": 14, "Low": 4}
 
-# Asset Schema v2 enum values -> points (weights documented above and in
-# docs/PRIORITY_RUBRIC.md).
+# These legacy weights use Asset Schema v2 category names.
 _BUSINESS_CRITICALITY_POINTS: Dict[str, int] = {
     "Mission Critical": 30,
     "High": 22,
@@ -120,9 +75,9 @@ class RuleContribution:
     """One rubric factor's contribution to the priority score."""
 
     factor: str
-    value: str  # human-readable evidence value used
+    value: str  # Display value rather than the policy point count.
     points: int
-    evidence_source: str  # which field(s) the value came from
+    evidence_source: str  # Asset field or derived exposure rule.
 
 
 @dataclass(frozen=True)
@@ -241,7 +196,6 @@ def calculate_organizational_priority(
     missing_gates: List[str] = []
     score = 0
 
-    # -- Factor 1: vulnerability severity (required; NVD base score banding)
     try:
         numeric_score = float(base_score) if base_score is not None else None
     except (TypeError, ValueError):
@@ -265,7 +219,6 @@ def calculate_organizational_priority(
             "(0.0/None/ di luar rentang 0-10)"
         )
 
-    # -- Factor 2: business criticality (required; Asset Schema v2 enum)
     criticality = _text(ctx.get("business_criticality"))
     if criticality in _BUSINESS_CRITICALITY_POINTS:
         points = _BUSINESS_CRITICALITY_POINTS[criticality]
@@ -284,7 +237,7 @@ def calculate_organizational_priority(
             "business_criticality aset tidak diketahui/tidak valid"
         )
 
-    # -- Factor 3: exposure (required; internet_exposed, zone-derived fallback)
+    # Legacy exposure falls back to network_zone when internet_exposed is unknown.
     exposed = _text(ctx.get("internet_exposed")).lower()
     zone = _text(ctx.get("network_zone"))
     if exposed == _EXPOSURE_YES:
@@ -337,7 +290,6 @@ def calculate_organizational_priority(
             "(internet_exposed dan network_zone tidak diketahui)"
         )
 
-    # -- Factor 4: data sensitivity (optional boost)
     sensitivity = _text(ctx.get("data_sensitivity"))
     if sensitivity in _DATA_SENSITIVITY_POINTS:
         points = _DATA_SENSITIVITY_POINTS[sensitivity]
@@ -353,7 +305,6 @@ def calculate_organizational_priority(
     else:
         unknown_factors.append("data_sensitivity")
 
-    # -- Factor 5: environment (optional boost; production only)
     environment = _text(ctx.get("environment"))
     if environment == "production":
         score += _ENVIRONMENT_PRODUCTION_POINTS
@@ -377,7 +328,7 @@ def calculate_organizational_priority(
     else:
         unknown_factors.append("environment")
 
-    # -- Factor 6: declared CIA baseline (optional; any H -> small boost)
+    # A declared H baseline adds a policy boost, not a CVSS adjustment.
     cia_values = [
         _text(ctx.get(f))
         for f in ("confidentiality_requirement", "integrity_requirement",
@@ -407,7 +358,6 @@ def calculate_organizational_priority(
     else:
         unknown_factors.append("cia_baseline")
 
-    # -- Status & classification
     if missing_gates:
         priority: Optional[str] = None
         status = _STATUS_INCOMPLETE

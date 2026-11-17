@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pytest
 import requests
 
-from nvd_client import fetch_cve_from_nvd, normalize_nvd_response
+from skripsi_rag.nvd_client import fetch_cve_from_nvd, normalize_nvd_response
 
 VECTOR = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
 

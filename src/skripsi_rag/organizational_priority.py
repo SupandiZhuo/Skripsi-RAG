@@ -1,4 +1,4 @@
-"""Deterministic organizational remediation priority (Phase C).
+"""Deterministic organizational remediation priority.
 
 Computes Organizational Priority (P1–P4) for a vulnerability affecting a
 specific asset. The module is intentionally separate from CVSS scoring:
@@ -27,7 +27,7 @@ from enum import Enum
 from math import isfinite
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from cve_applicability import ApplicabilityStatus
+from skripsi_rag.cve_applicability import ApplicabilityStatus
 
 RUBRIC_VERSION = "organizational-priority-v2.0"
 
@@ -43,14 +43,12 @@ FACTOR_MAX_POINTS: Dict[str, int] = {
 MAX_SCORE = sum(FACTOR_MAX_POINTS.values())
 assert MAX_SCORE == 100, "Review active factor weights before running experiments"
 
-# Thresholds for P1..P4.
 SCORE_THRESHOLDS: Sequence[Tuple[int, str, str]] = (
     (80, "P1", "Urgent"),
     (60, "P2", "High"),
     (40, "P3", "Normal"),
 )
 
-# Factor point tables.
 _SEVERITY_POINTS: Dict[str, int] = {
     "None": 0,
     "Critical": 30,
@@ -240,7 +238,7 @@ def calculate_organizational_priority(
     unknowns: List[str] = []
     score = 0
 
-    # --- CPE applicability (evaluated first because it can exclude or block) ---
+    # Check applicability first; it can block remediation priority.
     app_status: Optional[Any] = None
     app_evidence_source = "cve_applicability"
     if hasattr(applicability, "status"):
@@ -248,8 +246,7 @@ def calculate_organizational_priority(
     elif isinstance(applicability, Mapping):
         app_status = applicability.get("status")
 
-    # Normalize to enum when possible, so str/Enum handling works across
-    # Python versions.
+    # Accept both serialized status strings and enum values.
     if isinstance(app_status, str):
         try:
             app_status = ApplicabilityStatus(app_status)
@@ -276,7 +273,7 @@ def calculate_organizational_priority(
             asset_id=asset_id,
         )
 
-    # --- Vulnerability severity (prefer context_score, fall back to base_score) ---
+    # Prefer the Environmental score; fall back to the NVD Base score.
     severity: Optional[str] = None
     severity_source = "nvd.base_score"
     severity_score = context_score
@@ -303,7 +300,7 @@ def calculate_organizational_priority(
     else:
         missing.append("vulnerability severity (base or contextual CVSS)")
 
-    # --- Business criticality (required) ---
+    # Business criticality is required to assign an organizational priority.
     criticality = _text(ctx.get("business_criticality"))
     if criticality in _CRITICALITY_POINTS:
         points = _CRITICALITY_POINTS[criticality]
@@ -321,8 +318,6 @@ def calculate_organizational_priority(
     else:
         missing.append("business criticality")
 
-    # --- Internet exposure (required field, but unknown values are handled
-    # explicitly as 0 points rather than blocking classification) ---
     exposed = _text(ctx.get("internet_exposed")).lower()
     zone = _text(ctx.get("network_zone"))
     if exposed == "yes":
@@ -361,8 +356,7 @@ def calculate_organizational_priority(
             )
         )
     else:
-        # Unknown exposure is treated as 0 points (not low risk) and recorded
-        # as an unknown factor so the result remains explainable.
+        # Record unknown exposure explicitly; zero points do not mean low risk.
         contributions.append(
             PriorityRuleContribution(
                 rule="exposure:unknown",
@@ -375,7 +369,7 @@ def calculate_organizational_priority(
         )
         unknowns.append("internet exposure")
 
-    # --- Data sensitivity (optional) ---
+    # Sensitivity, environment and CIA baselines are optional policy factors.
     sensitivity = _text(ctx.get("data_sensitivity"))
     if sensitivity in _SENSITIVITY_POINTS:
         points = _SENSITIVITY_POINTS[sensitivity]
@@ -393,7 +387,6 @@ def calculate_organizational_priority(
     else:
         unknowns.append("data sensitivity")
 
-    # --- Environment (optional) ---
     environment = _text(ctx.get("environment"))
     if environment == "production":
         score += 5
@@ -421,7 +414,6 @@ def calculate_organizational_priority(
     else:
         unknowns.append("environment")
 
-    # --- CIA baseline (optional) ---
     cia_values = [
         _text(ctx.get(f))
         for f in ("confidentiality_requirement", "integrity_requirement", "availability_requirement")
@@ -452,7 +444,6 @@ def calculate_organizational_priority(
     else:
         unknowns.append("CIA baseline")
 
-    # --- CPE applicability (required) ---
     if app_status == ApplicabilityStatus.CONFIRMED:
         score += 15
         contributions.append(
@@ -481,14 +472,12 @@ def calculate_organizational_priority(
     else:
         missing.append("CPE applicability")
 
-    # graph_dependencies is intentionally ignored (compatibility-only).
+    # Graph dependencies remain an API argument but do not affect priority.
 
-    # --- Status resolution ---
     has_required_criticality = criticality in _CRITICALITY_POINTS
     missing = list(dict.fromkeys(missing))
     if app_status == ApplicabilityStatus.UNKNOWN:
-        # Unknown never enters the confirmed-remediation queue. The score and
-        # P-band here rank verification work, not patching decisions.
+        # Unknown applicability yields investigation priority only.
         investigation_priority = None
         investigation_level = None
         investigation_score = None
@@ -513,13 +502,12 @@ def calculate_organizational_priority(
             investigation_priority=investigation_priority,
         )
 
-    # Confirmed applicability is mandatory for remediation. Exposure remains
-    # optional (unknown = 0, disclosed); confirmed applicability can support
-    # classification when numerical severity is missing, as in the prior API.
+    # Remediation requires confirmed applicability and known business criticality.
+    # Exposure and numeric severity may be absent; missing evidence stays disclosed.
     can_classify = has_required_criticality and app_status == ApplicabilityStatus.CONFIRMED
 
     if not can_classify:
-        missing = list(dict.fromkeys(missing))  # dedupe while preserving order
+        missing = list(dict.fromkeys(missing))  # Keep diagnostics in first-seen order.
         return OrganizationalPriorityResult(
             priority=None,
             status=_STATUS_INCOMPLETE,

@@ -1,4 +1,4 @@
-"""Targeted checks for the Phase 2B pipeline switch to Asset Schema v2.
+"""Schema v2 asset context across ingestion, retrieval and model boundaries.
 
 Covers: the Streamlit app loads the corporate_assets_v2 collection with the
 ingested v2 assets, retrieval context exposes the full v2 evidence (while
@@ -8,7 +8,7 @@ ingestion. No live LLM/NVD calls are made.
 
 The app loader is inspected via AST, never imported in bare Streamlit mode.
 Integration stores are ingested under tmp_path with dummy embeddings. Run:
-python -m pytest test_pipeline_v2.py -q
+python -m pytest tests/test_asset_context_integration.py -q
 """
 
 import ast
@@ -16,20 +16,20 @@ from pathlib import Path
 
 from langchain_chroma import Chroma
 
-from asset_schema_v2 import load_assets
-from ingest_assets import (
+from skripsi_rag.asset_schema_v2 import load_assets
+from skripsi_rag.ingest_assets import (
     COLLECTION_NAME,
     COLLECTION_NAME_V2,
     build_v2_document,
     document_id,
     ingest_v2_to_chromadb,
 )
-from llm_assessment import TEMPLATE
-from rag_retrieval import CONTEXT_METADATA_FIELDS, filtered_metadata, retrieve_asset_context
+from skripsi_rag.llm_assessment import TEMPLATE
+from skripsi_rag.rag_retrieval import CONTEXT_METADATA_FIELDS, filtered_metadata, retrieve_asset_context
 from test_ingest_assets_v2 import DummyEmbeddings
 
 ROOT = Path(__file__).resolve().parents[1]
-V2_CSV = ROOT / "data" / "asset_data_v2.csv"
+V2_CSV = ROOT / "data" / "examples" / "asset_data_v2.csv"
 
 V1_ONLY_METADATA = {
     "asset_id": "SRV-100",
@@ -41,9 +41,6 @@ V1_ONLY_METADATA = {
 }
 
 
-# ---------------------------------------------------------------------------
-# 1. App loads the v2 collection (not the original one)
-# ---------------------------------------------------------------------------
 def test_collection_constants_are_distinct():
     assert COLLECTION_NAME_V2 == "corporate_assets_v2"
     assert COLLECTION_NAME == "corporate_assets"
@@ -51,7 +48,7 @@ def test_collection_constants_are_distinct():
 
 
 def test_app_vector_store_targets_v2_collection():
-    tree = ast.parse((ROOT / "app.py").read_text(encoding="utf-8"))
+    tree = ast.parse((ROOT / "src/skripsi_rag/ui.py").read_text(encoding="utf-8"))
     loader = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "load_vector_db")
     returns = [node.value for node in ast.walk(loader) if isinstance(node, ast.Return)]
     assert len(returns) == 1
@@ -63,7 +60,7 @@ def test_app_vector_store_targets_v2_collection():
     assert keywords["collection_name"].id == "COLLECTION_NAME_V2"
     assert ast.literal_eval(keywords["create_collection_if_not_exists"]) is False
     assert any(
-        isinstance(node, ast.ImportFrom) and node.module == "ingest_assets"
+        isinstance(node, ast.ImportFrom) and node.module == "skripsi_rag.ingest_assets"
         and any(alias.name == "COLLECTION_NAME_V2" and alias.asname is None for alias in node.names)
         for node in tree.body
     )
@@ -80,9 +77,6 @@ def test_temporary_v2_collection_contains_ingested_assets(tmp_path):
     assert all(doc_id.startswith("asset:") for doc_id in ids)
 
 
-# ---------------------------------------------------------------------------
-# 2. Retrieval context exposes full v2 evidence
-# ---------------------------------------------------------------------------
 def test_filtered_metadata_exposes_v2_evidence():
     rows = {row["asset_id"]: row for row in load_assets(str(V2_CSV))}
     metadata = build_v2_document(rows["SRV-001"]).metadata
@@ -119,9 +113,6 @@ def test_filtered_metadata_backward_compatible_with_v1_documents():
     assert "confidentiality_requirement" not in filtered
 
 
-# ---------------------------------------------------------------------------
-# 3. Retrieval against a v2 store returns v2 context
-# ---------------------------------------------------------------------------
 def test_retrieval_returns_v2_candidates_with_full_context(tmp_path):
     rows = load_assets(str(V2_CSV))
     documents = [build_v2_document(row) for row in rows]
@@ -149,9 +140,6 @@ def test_retrieval_returns_v2_candidates_with_full_context(tmp_path):
         assert "schema_version" in context
 
 
-# ---------------------------------------------------------------------------
-# 4. LLM prompt carries schema-v2 baseline rules
-# ---------------------------------------------------------------------------
 def test_prompt_excludes_baseline_labels_and_requires_independent_evidence():
     assert "excludes stored baseline and expert CR/IR/AR labels" in TEMPLATE
     assert "Infer CR, IR, and AR independently" in TEMPLATE

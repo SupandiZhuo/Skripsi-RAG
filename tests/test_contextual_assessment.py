@@ -5,7 +5,7 @@ Base metric preservation, absence of MAV, deterministic Environmental
 vector construction, and CVSS3 parsing of the generated vector.
 
 No live API calls are made - analyze_with_llm's LLM call is mocked.
-Run: python -m pytest test_contextual_assessment.py -q
+Run: python -m pytest tests/test_contextual_assessment.py -q
 """
 
 from unittest.mock import patch
@@ -14,8 +14,8 @@ import pytest
 from cvss import CVSS3
 from pydantic import ValidationError
 
-from cvss_engine import build_environmental_vector
-from llm_assessment import (
+from skripsi_rag.cvss_engine import build_environmental_vector
+from skripsi_rag.llm_assessment import (
     CiaRequirement,
     ContextualAssessment,
     LlmAssessmentError,
@@ -42,9 +42,6 @@ def make_assessment(cr="H", ir="M", ar="L", priority="P1"):
     )
 
 
-# ---------------------------------------------------------------------------
-# 1. Valid CR/IR/AR output
-# ---------------------------------------------------------------------------
 def test_valid_cia_requirement_values():
     for v in ("X", "L", "M", "H"):
         assessment = make_assessment(cr=v, ir=v, ar=v)
@@ -53,21 +50,15 @@ def test_valid_cia_requirement_values():
         assert assessment.availability_requirement.value == v
 
 
-# ---------------------------------------------------------------------------
-# 2. Invalid metric rejection
-# ---------------------------------------------------------------------------
 def test_invalid_cia_requirement_rejected():
     with pytest.raises(ValidationError):
         make_assessment(cr="CRITICAL")
     with pytest.raises(ValidationError):
-        make_assessment(ir="Medium")  # must be short code, not full word
+        make_assessment(ir="Medium")  # Requirements use CVSS letter codes.
     with pytest.raises(ValidationError):
         make_assessment(ar="Z")
 
 
-# ---------------------------------------------------------------------------
-# 3. Valid / invalid P1-P4 output
-# ---------------------------------------------------------------------------
 def test_valid_organizational_priority():
     for p in ("P1", "P2", "P3", "P4"):
         assessment = make_assessment(priority=p)
@@ -113,9 +104,6 @@ def test_undefined_metrics_allow_explicit_insufficient_evidence_reasons():
     assert all(not getattr(assessment.metric_reasons, metric).evidence_ids for metric in ("CR", "IR", "AR"))
 
 
-# ---------------------------------------------------------------------------
-# 4. Preservation of original Base metrics + 5. absence of MAV modification
-# ---------------------------------------------------------------------------
 def test_base_metrics_preserved_and_no_mav():
     assessment = make_assessment(cr="H", ir="M", ar="L")
     modified = build_environmental_vector(BASE_VECTOR, assessment)
@@ -141,9 +129,6 @@ def test_invalid_base_vector_rejected():
         build_environmental_vector("not-a-vector", make_assessment())
 
 
-# ---------------------------------------------------------------------------
-# 6. Deterministic Environmental vector construction + 8. CVSS3 parsing
-# ---------------------------------------------------------------------------
 def test_cvss3_parses_generated_vector_and_scores_deterministically():
     assessment = make_assessment(cr="H", ir="H", ar="H")
     modified = build_environmental_vector(BASE_VECTOR, assessment)
@@ -152,23 +137,18 @@ def test_cvss3_parses_generated_vector_and_scores_deterministically():
     base_score, temporal_score, env_score = cvss_obj.scores()
 
     assert base_score == pytest.approx(9.8)
-    assert env_score >= base_score  # higher CR/IR/AR should not lower env score
+    assert env_score >= base_score  # Raising CR/IR/AR must not lower the Environmental score.
     severities = cvss_obj.severities()
     assert severities[0] == "Critical"
 
 
-# ---------------------------------------------------------------------------
-# 7. Malformed/refused model output handling (mocked, no live API calls)
-# ---------------------------------------------------------------------------
 def test_analyze_with_llm_raises_on_malformed_response():
-    with patch("llm_assessment._build_llm"):
-        # Simulate `prompt | structured_llm` chain whose .invoke() returns
-        # something that is not a ContextualAssessment (malformed output).
+    with patch("skripsi_rag.llm_assessment._build_llm"):
         class FakeChain:
             def invoke(self, _):
                 return {"not": "a ContextualAssessment"}
 
-        with patch("llm_assessment.ChatPromptTemplate.__or__", return_value=FakeChain()):
+        with patch("skripsi_rag.llm_assessment.ChatPromptTemplate.__or__", return_value=FakeChain()):
             with pytest.raises(LlmAssessmentError, match="Unrecognized structured model response"):
                 analyze_with_llm(
                     api_key="fake-key",
@@ -183,7 +163,7 @@ def test_analyze_with_llm_raises_on_exception_during_invoke():
         def invoke(self, _):
             raise RuntimeError("simulated provider failure")
 
-    with patch("llm_assessment._build_llm"), patch("llm_assessment.ChatPromptTemplate.__or__", return_value=RaisingChain()):
+    with patch("skripsi_rag.llm_assessment._build_llm"), patch("skripsi_rag.llm_assessment.ChatPromptTemplate.__or__", return_value=RaisingChain()):
         with pytest.raises(LlmAssessmentError, match="simulated provider failure"):
             analyze_with_llm(
                 api_key="fake-key",
@@ -200,7 +180,7 @@ def test_analyze_with_llm_returns_valid_assessment_when_mocked():
         def invoke(self, _):
             return expected
 
-    with patch("llm_assessment._build_llm"), patch("llm_assessment.ChatPromptTemplate.__or__", return_value=FakeChain()):
+    with patch("skripsi_rag.llm_assessment._build_llm"), patch("skripsi_rag.llm_assessment.ChatPromptTemplate.__or__", return_value=FakeChain()):
         result = analyze_with_llm(
             api_key="fake-key",
             cve_desc="Some CVE description",
@@ -208,7 +188,7 @@ def test_analyze_with_llm_returns_valid_assessment_when_mocked():
             asset_context={"asset_id": "A1"},
         )
 
-    assert result == expected  # Provider output is revalidated, not returned unchecked.
+    assert result == expected  # Revalidate even when the provider returns a Pydantic model.
     assert result.confidentiality_requirement == CiaRequirement.MEDIUM
     assert result.organizational_priority == OrganizationalPriority.P2
 
@@ -218,7 +198,7 @@ def test_analyze_with_llm_rejects_citations_absent_from_supplied_context():
         def invoke(self, _):
             return make_assessment()  # Cites asset:A1, not the supplied asset:A2.
 
-    with patch("llm_assessment._build_llm"), patch("llm_assessment.ChatPromptTemplate.__or__", return_value=FakeChain()):
+    with patch("skripsi_rag.llm_assessment._build_llm"), patch("skripsi_rag.llm_assessment.ChatPromptTemplate.__or__", return_value=FakeChain()):
         with pytest.raises(LlmAssessmentError, match="evidence IDs absent from model input"):
             analyze_with_llm(
                 api_key="fake-key", cve_desc="Some CVE description",

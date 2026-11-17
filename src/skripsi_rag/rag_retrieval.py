@@ -14,10 +14,28 @@ from datetime import date
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
+
+def build_document_query(nvd_data: Mapping[str, Any], asset: Mapping[str, Any]) -> str:
+    """Search for organizational impact evidence, not CVE/asset identity.
+
+    CIA baseline/expert labels are deliberately excluded. Stable asset-ID
+    filtering still determines which documents may become evidence.
+    """
+    def text(source, key, limit):
+        value = source.get(key)
+        return value.strip()[:limit] if isinstance(value, str) else ""
+
+    return "\n".join([
+        f"Asset: {text(asset, 'asset_name', 120)}",
+        f"Business function / fungsi bisnis: {text(asset, 'business_function', 400)}",
+        "Dampak kehilangan kerahasiaan, perubahan data, gangguan layanan; kebutuhan integritas dan ketersediaan.",
+        "Organizational confidentiality, integrity, availability and business impact.",
+        f"Vulnerability: {text(nvd_data, 'cve_id', 40)} {text(nvd_data, 'description', 160)}",
+    ])
+
 DEFAULT_TOP_K = 3
 DEFAULT_CONFIDENCE_THRESHOLD = 0.15
 
-# Runtime extension field for editable software inventory (Phase B1).
 SOFTWARE_INVENTORY_FIELD = "software_inventory_json"
 
 
@@ -26,8 +44,8 @@ class AssetCandidate:
     """One retrieved asset candidate with its retrieval confidence."""
 
     metadata: Dict[str, Any]
-    confidence: float  # normalized relevance score, higher = more similar
-    distance: Optional[float] = None  # raw vectorstore distance, lower = more similar
+    confidence: float  # Similarity score, not a probability or an asset-identity check.
+    distance: Optional[float] = None  # Raw vector-store distance; lower values are more similar.
     content: str = ""
 
 
@@ -48,12 +66,8 @@ class RetrievalResult:
         return self.best is not None and self.best.confidence >= self.threshold
 
 
-# Metadata fields relevant to the vulnerability-assessment context (Asset
-# Schema v2). Fields not present in the underlying asset document are simply
-# omitted (kept optional), so v1 documents keep working while v2 documents
-# expose the full evidence: identity, placement, business function, software
-# inventory (CPE applicability), declared CVSS Environmental Requirement
-# baseline (CR/IR/AR), and provenance/freshness.
+# Missing metadata stays omitted for legacy inventory records.
+# CIA baselines stay available for policy/evaluation, not automatic model input.
 CONTEXT_METADATA_FIELDS = [
     "asset_id",
     "asset_name",
@@ -202,7 +216,7 @@ def update_asset_metadata(
     merged = dict(existing)
     merged.update(metadata_updates)
     try:
-        from ingest_assets import build_v2_document
+        from skripsi_rag.ingest_assets import build_v2_document
 
         document = build_v2_document(merged)
         # Keep runtime extension fields, including the editable software inventory.

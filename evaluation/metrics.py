@@ -176,7 +176,7 @@ def summarize_runs(records, labels=None):
         for run in runs:
             label = labels.get(run.get("scenario_id"), {})
             if experiment != "E0" and run.get("computed_environmental_score") is not None and all(label.get(key) in {"X", "L", "M", "H"} for key in ("cr", "ir", "ar")):
-                from cvss_engine import build_environmental_vector, calculate_cvss
+                from skripsi_rag.cvss_engine import build_environmental_vector, calculate_cvss
                 requirements = {"confidentiality_requirement": label["cr"], "integrity_requirement": label["ir"], "availability_requirement": label["ar"]}
                 expert_vector = build_environmental_vector(run["base_vector"], requirements)
                 expert_score = calculate_cvss(expert_vector)["environmental_score"]

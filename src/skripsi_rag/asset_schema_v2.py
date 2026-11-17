@@ -1,12 +1,7 @@
-"""Asset Knowledge Base Schema v2 validator (Phase 1).
+"""Validate the ordered Asset Schema v2 CSV format without opening a database.
 
-Validates rows of `data/asset_data_v2.csv` against the Schema v2 defined in
-`docs/ASSET_SCHEMA_V2.md`. Stdlib-only (csv module) so no new dependency is
-introduced. Kept separate from Streamlit/ingestion so it can be reused by
-evaluation scripts.
-
-Run: python asset_schema_v2.py            # validate data/asset_data_v2.csv
-     python asset_schema_v2.py <path>     # validate another CSV file
+See docs/ASSET_SCHEMA_V2.md. Run `python -m skripsi_rag.asset_schema_v2 [path]`;
+the default input is data/examples/asset_data_v2.csv.
 """
 
 import csv
@@ -14,7 +9,7 @@ import sys
 from datetime import date
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from asset_inventory import is_valid_cpe
+from skripsi_rag.asset_inventory import is_valid_cpe
 
 SCHEMA_VERSION = "2.0"
 UNKNOWN = "unknown"
@@ -48,11 +43,10 @@ V2_COLUMNS: List[str] = [
     "schema_version",
 ]
 
-# Runtime extensions may be appended in this order without changing existing
-# dataset headers. Loading never infers completeness from a primary CPE.
+# Append extensions in this order without changing existing CSV headers.
+# A primary CPE alone does not prove inventory completeness.
 V2_EXTENSION_COLUMNS = ("software_inventory_json", "inventory_verified")
 
-# Required fields must be present and non-empty (v1 columns + structural v2).
 REQUIRED_FIELDS: List[str] = [
     "asset_id",
     "asset_name",
@@ -85,7 +79,7 @@ OPTIONAL_FIELDS: List[str] = [
     "data_classification",
 ]
 
-# Allowed values (v1 enum values are preserved exactly, including casing).
+# Preserve case-sensitive v1 category names.
 ALLOWED_VALUES: Dict[str, Sequence[str]] = {
     "network_zone": ("Internal", "DMZ", "Restricted"),
     "business_criticality": ("Low", "Medium", "High", "Mission Critical"),
@@ -164,8 +158,7 @@ def validate_row(
                 f"but must be an ISO date (YYYY-MM-DD)"
             )
 
-    # Optional fields may be empty or 'unknown'; if present they must be
-    # non-blank-after-strip (no whitespace-only cells) - no other constraints.
+    # Missing optional fields use empty strings or 'unknown', not whitespace.
     for field in OPTIONAL_FIELDS:
         if field in row and row[field] is not None:
             raw = str(row[field])
@@ -216,9 +209,9 @@ def validate_csv(path: str) -> List[str]:
                     )
 
             seen_ids: Dict[str, int] = {}
-            for index, values in enumerate(reader, start=2):  # 1-based + header
+            for index, values in enumerate(reader, start=2):  # CSV diagnostics count the header as row 1.
                 if not any(str(v).strip() for v in values):
-                    continue  # skip blank lines
+                    continue  # Empty rows must not trigger missing-field errors.
                 if len(values) != len(header):
                     errors.append(
                         f"{path}: row {index}: expected {len(header)} fields "
@@ -253,7 +246,7 @@ def load_assets(path: str) -> List[Dict[str, str]]:
 
 
 def main(argv: Sequence[str]) -> int:
-    path = argv[1] if len(argv) > 1 else "data/asset_data_v2.csv"
+    path = argv[1] if len(argv) > 1 else "data/examples/asset_data_v2.csv"
     errors = validate_csv(path)
     if errors:
         print(f"FAIL: {path} - {len(errors)} error(s)")

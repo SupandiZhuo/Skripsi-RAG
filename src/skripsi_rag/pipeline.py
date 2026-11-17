@@ -16,15 +16,14 @@ from datetime import datetime, timezone
 from enum import Enum
 from collections.abc import Mapping
 
-from asset_inventory import collect_asset_cpes
-from cve_applicability import determine_applicability
-from cvss_engine import build_environmental_vector, calculate_cvss, validate_base_vector
-from llm_assessment import DEFAULT_MODEL, ContextualAssessment, analyze_with_llm
-from organizational_priority import calculate_organizational_priority
+from skripsi_rag.asset_inventory import collect_asset_cpes, inventory_is_verified
+from skripsi_rag.cve_applicability import determine_applicability
+from skripsi_rag.cvss_engine import build_environmental_vector, calculate_cvss, validate_base_vector
+from skripsi_rag.llm_assessment import DEFAULT_MODEL, ContextualAssessment, analyze_with_llm
+from skripsi_rag.organizational_priority import calculate_organizational_priority
 
-# Deliberate allowlist: hidden labels, contact/IP information and arbitrary
-# scenario payloads must never become model input. Policy CIA fields are
-# handled separately by build_model_context's provenance/leakage policy.
+# Exclude labels, contact/IP data and arbitrary scenario payloads from model input.
+# build_model_context applies the separate CIA-baseline leakage policy.
 _ASSET_FIELDS = {
     "asset_id", "asset_name", "environment", "internet_exposed", "business_criticality",
     "data_sensitivity", "data_classification", "network_zone", "asset_type",
@@ -85,8 +84,8 @@ def run_assessment(nvd_data, asset_metadata, api_key: str = "", experiment_id: s
     start = time.monotonic()
     nvd = dict(nvd_data or {})
     asset = {key: value for key, value in dict(asset_metadata or {}).items() if key in _ASSET_FIELDS}
-    import llm_assessment
-    import organizational_priority
+    from skripsi_rag import llm_assessment
+    from skripsi_rag import organizational_priority
     prompt = getattr(llm_assessment, "TEMPLATE", "")
     rubric_hash = hashlib.sha256(__import__("pathlib").Path(organizational_priority.__file__).read_bytes()).hexdigest()
     record = {
@@ -162,7 +161,7 @@ def run_assessment(nvd_data, asset_metadata, api_key: str = "", experiment_id: s
     applicability = None
     if experiment_id in {"E2", "E3"}:
         try:
-            verified = asset.get("inventory_verified") is True or asset.get("inventory_verified") == "true"
+            verified = inventory_is_verified(asset)
             applicability = determine_applicability(collect_asset_cpes(asset),
                 {"configurations": nvd.get("configurations", [])}, inventory_verified=verified)
             record["applicability"] = json_safe(applicability)
@@ -184,9 +183,9 @@ def run_assessment(nvd_data, asset_metadata, api_key: str = "", experiment_id: s
             if context_store is None:
                 return finish("failed", "retrieval_unavailable", "retrieval")
             try:
-                from rag_retrieval import retrieve_document_context
+                from skripsi_rag.rag_retrieval import build_document_query, retrieve_document_context
                 retrieval = retrieve_document_context(context_store,
-                    retrieval_query if retrieval_query is not None else nvd.get("description", ""),
+                    retrieval_query if retrieval_query is not None else build_document_query(nvd, asset),
                     asset.get("asset_id", ""), top_k=top_k, relevance_threshold=relevance_threshold)
                 record["retrieval"] = json_safe(retrieval)
                 if retrieval.error:
@@ -201,7 +200,7 @@ def run_assessment(nvd_data, asset_metadata, api_key: str = "", experiment_id: s
                                             "exception_class": type(exc).__name__})
                 return finish("failed")
         try:
-            from llm_assessment import build_model_context
+            from skripsi_rag.llm_assessment import build_model_context
             context = build_model_context(asset, retrieved_evidence=evidence)
         except Exception as exc:
             record["failures"].append({"error_type": "context_validation_failure", "stage": "context",

@@ -1,15 +1,31 @@
-# Python
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/
+*.egg-info/
+build/
+dist/
+.env
+.env.*
+!.env.example
 
-# Streamlit
 .streamlit/secrets.toml
 
-# Generated / runtime artifacts
+# Runtime history and evidence may contain private organizational data.
 chroma_db/
 data/assessment_history.json
+.cache/nvd/
+data/va_live_test_results/
+data/private/
 
-# Tooling
+# Ignore old input paths if private files are copied back to the root.
+/va-user-input/
+/Paket_Aset_RAG_Skripsi_Orion/
+/opencode.jsonc
+*.log
+*.zip
+*.pem
+*.key
+
 .opencode/
 .vscode/

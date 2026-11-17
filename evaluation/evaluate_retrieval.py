@@ -341,7 +341,7 @@ def _live_rankings(labels: list[dict], *, split: str, path: str,
     from langchain_huggingface import HuggingFaceEmbeddings
     if __package__ in (None, ""):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from rag_retrieval import retrieve_document_context
+    from skripsi_rag.rag_retrieval import retrieve_document_context
 
     client = chromadb.PersistentClient(path=str(directory))
     collection = client.get_collection(name=COLLECTION, embedding_function=None)

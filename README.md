@@ -1,108 +1,103 @@
-# Asset Intelligence & Context-Aware Vulnerability Assessment (NVD + RAG)
+# Context-Aware Vulnerability Assessment — NVD + RAG
 
-S1 thesis prototype demonstrating a **Context-Aware Vulnerability Assessment**
-pipeline that combines NVD threat intelligence with organizational asset
-context retrieved via RAG, interpreted by an LLM, and scored deterministically
-with CVSS v3.1. The application presents a searchable asset inventory and a
-focused vulnerability-analysis workflow matching `Design.png`. This is a
-single-user research prototype; the supplied asset examples are synthetic.
-See `docs/RESEARCH_SCOPE.md`, `docs/METHODOLOGY.md` and `docs/LIMITATIONS.md`.
+S1 thesis prototype for contextual triage of **existing Acunetix Vulnerabilities
+CSV reports**. The application combines NVD technical data with organizational
+asset evidence from ChromaDB, uses Gemini to interpret CR/IR/AR, and calculates
+numerical CVSS scores with deterministic code.
 
-## Pipeline
+This is a single-user research prototype. The public asset examples are
+synthetic; private company records and live test results are not included in Git.
 
-```
-CVE ID
-  -> NVD API (CVE description, original CVSS v3.1 vector, base score)
-  -> Exact asset-ID lookup + asset-filtered document retrieval (ChromaDB)
-  -> Cloud LLM (interprets NVD info + RAG context)
-       -> confidentiality_requirement (CR): X | L | M | H
-       -> integrity_requirement (IR):        X | L | M | H
-       -> availability_requirement (AR):     X | L | M | H
-       -> organizational_priority (suggestion): P1 | P2 | P3 | P4
-       -> justification, remediation
-  -> Deterministic code builds the Environmental CVSS vector
-       (Base metrics AV/AC/PR/UI/S/C/I/A preserved as-is from NVD; MAV left
-       undefined/X - no MAV inference in this prototype)
-  -> `cvss` Python library calculates the numerical Environmental score
-   -> Deterministic rubric computes Organizational Priority (P1-P4) from
-      contextual CVSS score, Asset Schema v2 evidence, CPE applicability,
-      without graph dependency points (organizational_priority.py)
-   -> UI: Vulnerability Analysis, Asset Inventory, Analysis History
+## Assessment workflow
+
+```text
+Acunetix Vulnerabilities CSV
+  → validate findings and confirm target-to-asset mapping
+  → extract explicit CVE identifiers and retrieve NVD CVSS v3.1 data
+  → check CPE applicability against the installed-software inventory
+  → retrieve attributed organizational documents for the selected asset
+  → schema-validated CR / IR / AR, reasons, citations and remediation
+  → deterministic Environmental CVSS and organizational priority rubric
+  → review, export and assessment history
 ```
 
-**Responsibility boundaries (must not blur):**
+**Technical Severity and Organizational Priority are separate outputs.** NVD
+provides the technical baseline. The model does not invent numerical CVSS scores
+or change Base metrics. Unknown applicability produces investigation priority
+and a provisional contextual score; it does not authorize remediation priority.
+CVE-less findings, unsupported vectors, missing evidence and failures remain
+visible. The application does not initiate scans or call the scanner API.
 
-| Component | Produces |
-|---|---|
-| NVD API | CVE description, Base CVSS v3.1 vector, base score |
-| RAG (ChromaDB) | Asset-filtered context documents, source IDs, relevance scores and accepted/rejected evidence |
-| Cloud LLM (prototype model) | CR / IR / AR / organizational_priority **suggestion** / justification / remediation only |
-| Deterministic code (`cvss_engine.py`) | Strict Base v3.1 validation and Environmental vector construction |
-| `cvss` library | The only component that computes numerical CVSS scores |
-| `organizational_priority.py` | Confirmed remediation P1–P4; separate investigation priority for Unknown; no priority for Not Applicable; explicit missing-evidence state |
-| `priority_rubric.py` | Legacy deterministic priority rubric (kept for reference/tests) |
+## Quick start
 
-The LLM never generates a CVSS vector string, a numerical score, or modifies
-Base metrics — its output is schema-validated (Pydantic) before use.
-
-## Project layout
-
-- `app.py` — Streamlit UI with initial/result analysis states, inventory editing and history.
-- `nvd_client.py`, `cvss_engine.py`, `pipeline.py` — UI-independent NVD, deterministic scoring and E0–E3 assessment functions.
-- `evaluation/` — Batch experiment runner, frozen run settings and evaluation metrics; no fabricated expert labels/results.
-- `llm_assessment.py` — `ContextualAssessment` schema, prompt template, and `analyze_with_llm()` (currently backed by Gemini via `_build_llm()`, isolated for future model swap).
-- `rag_retrieval.py` — Exact inventory lookup, asset-filtered document retrieval and traceable relevance gating. Scores are not calibrated probabilities.
-- `ingest_assets.py` — Ingestion scripts: `python ingest_assets.py` embeds v1 `asset_data.csv` into `corporate_assets`; `python ingest_assets.py --v2` embeds `data/asset_data_v2.csv` into `corporate_assets_v2` (Schema v2, deterministic IDs, idempotent upsert).
-- `asset_data.csv` / `data/asset_data_v2.csv` — Sample organizational asset inventory; v2 adds environment, internet_exposed, software/CPE, CVSS CR/IR/AR baseline, and provenance fields (see `docs/ASSET_SCHEMA_V2.md`).
-- `asset_schema_v2.py` — Stdlib Schema v2 validator used before every v2 ingestion.
-- `priority_rubric.py` — Legacy baseline only, not the active application rubric.
-- `organizational_priority.py` — Active versioned rubric; see `docs/PRIORITY_RUBRIC.md`. Weights still require independent expert review.
-- `asset_inventory.py` — Software inventory serialization, CPE validation, and CPE collection for applicability matching (Phase B1).
-- `assessment_history.py` — Minimal JSON persistence for completed vulnerability assessments.
-- `cve_applicability.py` — CPE-based CVE applicability matching against NVD CPE configurations.
-- `data/assessment_history.json` — Saved assessment results (created on first save).
-- `.streamlit/config.toml` — Project theme and server settings.
-- `tests/` — All test modules (run with `python -m pytest tests -q` from the project root):
-  - `tests/conftest.py` — Puts the project root on `sys.path` so tests import root modules.
-  - `tests/test_contextual_assessment.py` — Targeted checks for schema validation, Base metric preservation, MAV absence, and deterministic vector/score construction (LLM calls mocked, no live API usage).
-  - `tests/test_priority_rubric.py` — Targeted checks for the priority rubric.
-  - `tests/test_app_ui.py` — Headless Streamlit `AppTest` checks: navigation, asset selection/editing, result persistence and a mocked analysis.
-  - `tests/test_asset_map_ui.py` — Regression guard that the retired graph UI (Cytoscape / `asset_graph`) is never loaded by the active app.
-  - `tests/test_assessment_history.py` — Targeted checks for assessment history save/load/delete.
-  - `tests/test_asset_inventory.py` — Tests for asset metadata updates, software inventory persistence, CPE validation, and legacy-collection preservation.
-
-## Setup
+Runtime: **Python 3.12.14**, with pinned dependencies in `uv.lock` and CPU PyTorch.
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run from
+the repository root on Windows:
 
 ```powershell
-pip install -r requirements.lock
-python ingest_assets.py --v2   # one-time: embeds asset_data_v2.csv into ./chroma_db (corporate_assets_v2)
-streamlit run app.py
+uvx --from uv==0.13.8 uv sync --locked
+.\.venv\Scripts\python.exe scripts/ingest_assets.py --v2
+.\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
-A Google Gemini API key and explicit authorization to send sanitized context
-to the cloud model are required for live LLM assessments. Configure the model
-ID in Settings for an available model in your account. E0 batch assessments do
-not call the model. Do not ingest private material without written permission.
+Skip ingestion when your database is already initialized. The `--v2` command
+loads only the public synthetic inventory; document-RAG assessment additionally
+requires authorized organizational context. For the local Orion package, custom
+sources, Docker, Linux commands and runtime configuration, see [Setup](docs/SETUP.md).
+Enter the Gemini API key in UI Settings and provide cloud consent before a live
+assessment. Open [http://localhost:8501](http://localhost:8501).
 
-`requirements.lock` resolves application and test dependencies for Python 3.13;
-`requirements-dev.txt` contains the development input requirements. Actual
-test environment versions are recorded separately from a resolver-produced lock.
-
-## Run tests
+With Docker Desktop/Engine and Compose, an inventory-only demo is:
 
 ```powershell
-python -m pytest -q
+docker compose run --rm --build app python scripts/ingest_assets.py --v2
+docker compose up -d app
 ```
 
-## Research readiness
+The private-package initialization command is documented in [Setup](docs/SETUP.md).
+Docker uses persistent volumes for ChromaDB, history, NVD snapshots and model
+files. It does not copy private inputs or existing native state into the image.
 
-The implementation separates technical severity, remediation priority,
-investigation priority and applicability, and supports E0–E3 ablations outside
-the UI. That infrastructure does **not** establish scientific accuracy.
+## Repository layout
 
-Before claiming improvement, supply authorized company evidence, independent
-expert CR/IR/AR and priority labels, document relevance labels and grouped
-validation/test splits. Freeze the model, snapshots, collection, threshold and
-rubric before final evaluation. Default retrieval thresholds and priority
-weights remain research choices requiring validation. Fine-tuning, full graph
-dependencies, CVSS v4 and production multiuser deployment are future work.
+```text
+app.py                    Streamlit entry point
+src/skripsi_rag/          Application UI and assessment/asset/RAG/VA modules
+scripts/                  Command-line entry points
+evaluation/               UI-independent research runners and metrics
+tests/                    Offline regression tests and public-fixture references
+data/examples/            Public synthetic asset inventories
+data/private/             Local authorized inputs (ignored by Git)
+docs/                     Setup, usage, methodology and research boundaries
+requirements/             Generated runtime/dev dependency exports
+Dockerfile, compose.yaml  Container configuration
+pyproject.toml, uv.lock   Python package configuration and dependency lock
+```
+
+The `skripsi_rag` package contains `ui.py`, `pipeline.py`, `nvd_client.py`,
+`llm_assessment.py`, `rag_retrieval.py`, `cvss_engine.py`, the active
+`organizational_priority.py` rubric, asset/schema/ingestion helpers, VA import and
+batch helpers, and history persistence. `legacy_priority_rubric.py` contains the
+older policy used for baseline comparisons.
+
+## Documentation
+
+- [Setup and Docker](docs/SETUP.md)
+- [VA CSV usage and evidence boundaries](docs/USAGE.md)
+- [Development, dependency updates and GitHub preparation](docs/DEVELOPMENT.md)
+- [Data layout and private inputs](data/README.md)
+- [Research scope](docs/RESEARCH_SCOPE.md), [methodology](docs/METHODOLOGY.md),
+  [limitations](docs/LIMITATIONS.md)
+- [Asset Schema v2](docs/ASSET_SCHEMA_V2.md) and [priority rubric](docs/PRIORITY_RUBRIC.md)
+
+## Tests and research status
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+Four existing tests require archived NVD fixtures that are not currently bundled;
+see [Development](docs/DEVELOPMENT.md). Mocked tests and live engineering checks
+are not expert validation. The E0–E3 experiment infrastructure still requires
+independent expert labels, relevance annotations, frozen splits and reviewed
+priority weights before making scientific improvement claims.

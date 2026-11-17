@@ -1,33 +1,36 @@
-"""Editable asset inventory helpers (Phase B1).
+"""Serialize installed software and collect CPEs for applicability checks.
 
-Supports associating multiple installed software records (with CPE 2.3
-identifiers) to an asset and collecting the full CPE inventory for the
-applicability evaluator. The software inventory is stored as a JSON string in
-ChromaDB metadata under `software_inventory_json`, which is a runtime extension
-of Asset Schema v2 and is treated as optional everywhere.
+Software records use JSON metadata; inventory completeness requires an explicit
+attestation and valid CPEs, not merely a nonempty product list.
 """
 
 import json
 from typing import Any, Dict, List, Mapping
 
-from cve_applicability import parse_cpe
+from skripsi_rag.cve_applicability import parse_cpe
 
 SOFTWARE_INVENTORY_FIELD = "software_inventory_json"
 INVENTORY_VERIFIED_FIELD = "inventory_verified"
 
 
-def load_software_inventory(asset_metadata: Mapping[str, Any]) -> List[Dict[str, str]]:
-    """Load software records from asset metadata."""
+def load_software_inventory(asset_metadata: Mapping[str, Any], *, strict: bool = False) -> List[Dict[str, str]]:
+    """Read inventory metadata; strict mode rejects malformed JSON and non-objects."""
     raw = asset_metadata.get(SOFTWARE_INVENTORY_FIELD, "")
-    if not raw or str(raw).lower() == "unknown":
+    if raw is None or raw == "" or (isinstance(raw, str) and raw.lower() == "unknown"):
         return []
     try:
         data = json.loads(raw)
-        if isinstance(data, list):
-            return [dict(r) for r in data if isinstance(r, Mapping)]
-    except (ValueError, TypeError):
-        pass
-    return []
+    except (ValueError, TypeError) as exc:
+        if strict:
+            raise ValueError("Software inventory is not valid JSON.") from exc
+        return []
+    if not isinstance(data, list):
+        if strict:
+            raise ValueError("Software inventory must be a JSON array of objects.")
+        return []
+    if strict and any(not isinstance(record, Mapping) for record in data):
+        raise ValueError("Software inventory contains a non-object record.")
+    return [dict(record) for record in data if isinstance(record, Mapping)]
 
 
 def save_software_inventory(software: List[Mapping[str, Any]]) -> str:

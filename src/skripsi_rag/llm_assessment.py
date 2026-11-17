@@ -16,17 +16,17 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from rag_retrieval import (
+from skripsi_rag.rag_retrieval import (
     DOCUMENT_PROVENANCE_FIELDS, DOCUMENT_SCORING_METHOD, DocumentEvidence,
     document_provenance_error,
 )
 
-# A configurable deployment default, not a claim about the provider's latest model.
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# Model availability depends on the provider account.
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 PROMPT_VERSION = "contextual-requirements-v2.0"
 
-# Intentionally excludes CR/IR/AR baselines, expert labels, priority and CVSS
-# scores, owner contacts, arbitrary metadata, and nested evaluation results.
+# Exclude stored CIA baselines, expert labels, scores and contact data.
+# Arbitrary metadata and nested evaluation results must not reach the model.
 MODEL_ASSET_FIELDS = (
     "asset_id", "asset_name", "network_zone", "business_criticality",
     "data_sensitivity", "environment", "internet_exposed", "asset_type",
@@ -39,8 +39,8 @@ SOFTWARE_FIELDS = ("vendor", "software_name", "software_version", "version", "cp
 MAX_FIELD_CHARS = 4000
 MAX_DOCUMENT_CHARS = 8000
 MAX_DOCUMENTS = 20
-# Defense against explicit answer-label leakage embedded in free text. This is
-# not a general prompt-injection detector; role separation is also mandatory.
+# Detect explicit answer labels in free text.
+# Keep prompt/data separation; this is not a general injection detector.
 ANSWER_LABEL_PATTERN = re.compile(
     r"\b(?:confidentiality[ _-]+requirement|integrity[ _-]+requirement|"
     r"availability[ _-]+requirement|(?:CR|IR|AR)[\"']?\s*[:=]|"
@@ -82,9 +82,8 @@ def build_model_context(asset_metadata, retrieved_evidence=None) -> dict[str, An
     if not isinstance(asset_metadata, Mapping):
         raise ValueError("asset_metadata must be a mapping")
     if isinstance(asset_metadata.get("asset"), Mapping):
-        # Already sanitized contexts are revalidated below; original content
-        # hashes cannot be rechecked after redaction, so retain raw validated
-        # chunks only at the first boundary and validate sanitized ones explicitly.
+        # Revalidate sanitized contexts against the redacted text hash.
+        # Original content hashes are checked only before redaction.
         return _resanitize_model_context(asset_metadata)
     asset = _allowed_values(asset_metadata, MODEL_ASSET_FIELDS)
     asset_id = asset_metadata.get("asset_id")
@@ -287,7 +286,8 @@ final organizational priority is calculated by explicit organizational policy.
 
 
 def _build_llm(api_key: str, model: str) -> ChatGoogleGenerativeAI:
-    return ChatGoogleGenerativeAI(model=model, google_api_key=api_key, temperature=0)
+    return ChatGoogleGenerativeAI(model=model, google_api_key=api_key, temperature=0,
+                                 timeout=60, max_retries=1)
 
 
 def analyze_with_llm(
@@ -299,8 +299,7 @@ def analyze_with_llm(
 ) -> ContextualAssessment:
     """Keep the existing call API, but enforce sanitized inputs and real citations."""
     try:
-        # E1 deliberately supplies no organizational evidence. Do not invent
-        # an asset identity merely to satisfy the direct-context schema.
+        # E1 has no asset evidence; do not invent an asset to satisfy the schema.
         context = {} if asset_context == {} else build_model_context(asset_context)
         if not isinstance(cve_desc, str) or not isinstance(original_vector, str):
             raise ValueError("CVE description and NVD vector must be text")
@@ -316,7 +315,7 @@ def analyze_with_llm(
         }, ensure_ascii=False, allow_nan=False)})
         if not isinstance(result, ContextualAssessment):
             raise ValueError("Unrecognized structured model response")
-        # Validate again even if a provider/mock constructed an unchecked model.
+        # Provider adapters can bypass Pydantic validation with model_construct().
         result = ContextualAssessment.model_validate(result.model_dump())
         valid_ids = {item["evidence_id"] for item in context.get("retrieved_evidence", [])}
         if context.get("asset_evidence_id"):

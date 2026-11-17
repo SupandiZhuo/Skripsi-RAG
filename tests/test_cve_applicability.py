@@ -1,15 +1,15 @@
-"""Hardened tests for CVE applicability matching (Phase A.1).
+"""CPE matching, version boundaries and three-valued NVD applicability checks.
 
 Covers: version-range boundaries (inclusive/exclusive), mixed AND/OR logic,
 nested child nodes, negate flags, multiple installed CPEs, missing/unknown
 inventory, unsupported version schemes, false-positive prevention, and
 backward compatibility.
-Run: python -m pytest test_cve_applicability.py -q
+Run: python -m pytest tests/test_cve_applicability.py -q
 """
 
 import pytest
 
-from cve_applicability import (
+from skripsi_rag.cve_applicability import (
     ApplicabilityStatus,
     cpe_matches,
     determine_applicability,
@@ -40,9 +40,6 @@ def _configs(*configs) -> dict:
     return {"configurations": list(configs)}
 
 
-# ---------------------------------------------------------------------------
-# Basic parsing and exact matching
-# ---------------------------------------------------------------------------
 def test_parse_cpe_extracts_parts():
     parts = parse_cpe("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*")
     assert parts["part"] == "a"
@@ -66,9 +63,6 @@ def test_cpe_matches_exact_and_wildcard():
     )
 
 
-# ---------------------------------------------------------------------------
-# Version-range boundaries
-# ---------------------------------------------------------------------------
 def test_version_start_inclusive():
     cfg = _configs(_config(_node(matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:*:*:*:*:*:*:*:*", versionStartIncluding="2.0.0", versionEndIncluding="2.17.0"),
@@ -87,20 +81,15 @@ def test_version_start_exclusive_and_end_exclusive():
     assert determine_applicability("cpe:2.3:a:apache:log4j:2.17.0:*:*:*:*:*:*:*", cfg, inventory_verified=True).status == ApplicabilityStatus.NOT_APPLICABLE
 
 
-# ---------------------------------------------------------------------------
-# Mixed AND/OR
-# ---------------------------------------------------------------------------
 def test_and_requires_all_conditions():
     cfg = _configs(_config(_node(operator="AND", matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:*:*:*:*:*:*:*:*", versionStartIncluding="2.0.0", versionEndIncluding="2.17.0"),
         _cpe_match("cpe:2.3:o:microsoft:windows:10:*:*:*:*:*:*:*"),
     ])))
-    # Both match
     assert determine_applicability(
         ["cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*", "cpe:2.3:o:microsoft:windows:10:*:*:*:*:*:*:*"],
         cfg,
     ).status == ApplicabilityStatus.CONFIRMED
-    # Only one matches
     assert determine_applicability(
         ["cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*", "cpe:2.3:o:linux:linux_kernel:5.0:*:*:*:*:*:*:*"],
         cfg,
@@ -117,9 +106,6 @@ def test_or_any_condition():
     assert determine_applicability("cpe:2.3:a:apache:log4j:2.16.0:*:*:*:*:*:*:*", cfg, inventory_verified=True).status == ApplicabilityStatus.NOT_APPLICABLE
 
 
-# ---------------------------------------------------------------------------
-# Nested child nodes
-# ---------------------------------------------------------------------------
 def test_nested_children_or_inside_and():
     cfg = _configs(_config(_node(operator="AND", children=[
         _node(operator="OR", matches=[
@@ -142,12 +128,8 @@ def test_nested_children_or_inside_and():
     ).status == ApplicabilityStatus.NOT_APPLICABLE
 
 
-# ---------------------------------------------------------------------------
-# Negate and vulnerable:false semantics
-# ---------------------------------------------------------------------------
 def test_vulnerable_false_does_not_override_vulnerable_true_in_or():
-    # OR: vulnerable:true range covering 2.17.0, vulnerable:false for 2.17.0.
-    # The vulnerable:true match should still yield Confirmed.
+    # A vulnerable:false OR branch does not cancel a matching vulnerable target.
     cfg = _configs(_config(_node(operator="OR", matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:*:*:*:*:*:*:*:*", versionStartIncluding="2.0.0", versionEndIncluding="2.17.0"),
         _cpe_match("cpe:2.3:a:apache:log4j:2.17.0:*:*:*:*:*:*:*", vulnerable=False),
@@ -156,8 +138,7 @@ def test_vulnerable_false_does_not_override_vulnerable_true_in_or():
 
 
 def test_vulnerable_false_contextualizes_within_and():
-    # AND: vulnerable:true range, vulnerable:false for 2.17.0.
-    # vulnerable:false is a supporting condition, NOT a Boolean negation.
+    # vulnerable:false supplies an AND condition; it does not negate the target.
     cfg = _configs(_config(_node(operator="AND", matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:*:*:*:*:*:*:*:*", versionStartIncluding="2.0.0", versionEndIncluding="2.17.0"),
         _cpe_match("cpe:2.3:a:apache:log4j:2.17.0:*:*:*:*:*:*:*", vulnerable=False),
@@ -179,9 +160,6 @@ def test_node_negate():
     assert determine_applicability("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*", cfg, inventory_verified=True).status == ApplicabilityStatus.NOT_APPLICABLE
 
 
-# ---------------------------------------------------------------------------
-# Multiple installed CPEs
-# ---------------------------------------------------------------------------
 def test_multiple_asset_cpes_string_delimited():
     cfg = _configs(_config(_node(matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*"),
@@ -201,9 +179,6 @@ def test_multiple_asset_cpes_list():
     assert determine_applicability(cpes, cfg).status == ApplicabilityStatus.CONFIRMED
 
 
-# ---------------------------------------------------------------------------
-# Missing / unknown inventory
-# ---------------------------------------------------------------------------
 def test_unknown_asset_cpe_returns_unknown():
     cfg = _configs(_config(_node(matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*"),
@@ -220,9 +195,6 @@ def test_missing_version_returns_unknown_when_range_used():
     assert determine_applicability("cpe:2.3:a:apache:log4j:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.UNKNOWN
 
 
-# ---------------------------------------------------------------------------
-# Unsupported version schemes
-# ---------------------------------------------------------------------------
 def test_alphanumeric_version_returns_unknown():
     cfg = _configs(_config(_node(matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*"),
@@ -237,9 +209,6 @@ def test_unsupported_version_scheme_in_range_returns_unknown():
     assert determine_applicability("cpe:2.3:a:apache:log4j:beta:*:*:*:*:*:*:*", cfg).status == ApplicabilityStatus.UNKNOWN
 
 
-# ---------------------------------------------------------------------------
-# False-positive prevention
-# ---------------------------------------------------------------------------
 def test_different_product_is_not_applicable():
     cfg = _configs(_config(_node(matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*"),
@@ -261,9 +230,6 @@ def test_version_outside_range_is_not_applicable():
     assert determine_applicability("cpe:2.3:a:apache:log4j:2.17.0:*:*:*:*:*:*:*", cfg, inventory_verified=True).status == ApplicabilityStatus.NOT_APPLICABLE
 
 
-# ---------------------------------------------------------------------------
-# Backward compatibility
-# ---------------------------------------------------------------------------
 def test_backward_compatible_direct_node_container():
     """Old callers passed {"nodes": [...]} instead of {"configurations": [...]}."""
     cfg = {"nodes": [_node(matches=[_cpe_match("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*")])]}
@@ -307,9 +273,7 @@ def test_explicit_non_match_distinguished_from_unknown():
     assert any(ev.get("reason") == "version_explicitly_outside_range" for ev in result.evidence)
 
 
-# ---------------------------------------------------------------------------
-# Three-valued Kleene logic: Unknown must not be silently dropped
-# ---------------------------------------------------------------------------
+# Unknown values must participate in three-valued logic.
 def test_or_with_true_and_unknown_returns_true():
     cfg = _configs(_config(_node(operator="OR", matches=[
         _cpe_match("cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*"),

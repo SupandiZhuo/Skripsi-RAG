@@ -17,7 +17,7 @@ EXPERIMENTS = ("E0", "E1", "E2", "E3")
 @dataclass(frozen=True)
 class ExperimentConfig:
     experiments: tuple[str, ...] = ("E0",)
-    model: str = "gemini-2.5-flash"
+    model: str = "gemini-3.1-flash-lite"
     embedding_model: str = "all-MiniLM-L6-v2"
     top_k: int = 3
     relevance_threshold: float = 0.15
@@ -72,10 +72,13 @@ def freeze_manifest(config: ExperimentConfig, path, *, input_paths=(), extra=Non
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             versions[name] = None
-    sources = ["pipeline.py", "nvd_client.py", "cvss_engine.py", "llm_assessment.py",
-               "rag_retrieval.py", "cve_applicability.py", "organizational_priority.py",
-               "evaluation/config.py", "evaluation/metrics.py", "evaluation/run_experiments.py",
-               "requirements.txt", "requirements.lock"]
+    sources = [f"src/skripsi_rag/{name}" for name in (
+        "pipeline.py", "nvd_client.py", "cvss_engine.py", "llm_assessment.py",
+        "rag_retrieval.py", "cve_applicability.py", "organizational_priority.py",
+        "va_import.py", "va_batch.py", "asset_inventory.py", "asset_package.py",
+    )] + ["app.py", "scripts/ingest_assets.py", "evaluation/config.py", "evaluation/metrics.py",
+         "evaluation/run_experiments.py", "pyproject.toml", "uv.lock",
+         "requirements/runtime.txt", "requirements/dev.txt"]
     manifest = {
         "manifest_version": "experiment-manifest-v1", "config": config_data,
         "config_sha256": hashlib.sha256(canonical.encode()).hexdigest(),

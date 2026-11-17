@@ -3,9 +3,9 @@
 ## Source of truth and scope
 
 `organizational_priority.py:calculate_organizational_priority` is the **only
-active deterministic rubric**. `priority_rubric.py` is a legacy Phase 2C
-baseline retained for historical comparisons and compatibility; its 70/50/30
-thresholds and six-factor weights are not the active algorithm.
+active deterministic rubric**. `legacy_priority_rubric.py` is retained for
+baseline comparisons; its 70/50/30 thresholds, six-factor weights and lack of
+a CPE applicability gate are not the active algorithm.
 
 The active algorithm identifier is `organizational-priority-v2.0`, exposed
 as `RUBRIC_VERSION` and included in every structured result.

@@ -8,7 +8,7 @@ Status (Phase 2):
 
 - **Phase 2A** implemented the schema validator, the sample dataset, and a
   dedicated ingestion pipeline (`ingest_assets.py --v2`) that embeds
-  `data/asset_data_v2.csv` into a NEW ChromaDB collection
+  `data/examples/asset_data_v2.csv` into a NEW ChromaDB collection
   `corporate_assets_v2` (deterministic `asset:<asset_id>` IDs, upsert,
   idempotent). The original `corporate_assets` collection and the v1
   ingestion workflow were not modified.
@@ -35,7 +35,7 @@ Status (Phase 2):
 
 ## Sample dataset
 
-`data/asset_data_v2.csv` contains the seven original sample assets
+`data/examples/asset_data_v2.csv` contains the seven original sample assets
 (SRV-001 … SRV-007) migrated from `asset_data.csv`. **All sample data is
 synthetic** (`is_synthetic=true`, `source=synthetic_sample`); it does not
 describe any real organization's assets.
@@ -149,7 +149,7 @@ overrides):
 Lightweight stdlib validator (no new dependencies):
 
 ```powershell
-python asset_schema_v2.py                    # validates data/asset_data_v2.csv
+python -m skripsi_rag.asset_schema_v2                    # validates data/examples/asset_data_v2.csv
 python -m pytest test_asset_schema_v2.py -q   # automated tests
 ```
 
@@ -164,5 +164,5 @@ expected-vs-actual values.
 | `asset_id`, `asset_name`, `ip_address`, `network_zone`, `business_criticality`, `data_sensitivity`, `description` | Retained byte-identical |
 | *(none)* | + 19 new fields, `unknown`/`X` where no source data |
 
-`asset_data.csv` (v1) remains the dataset ingested into the existing
+`data/examples/asset_data_v1.csv` (originally `asset_data.csv`) remains the dataset ingested into the existing
 `corporate_assets` ChromaDB collection until Phase 2.

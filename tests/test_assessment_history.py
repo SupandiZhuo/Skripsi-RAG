@@ -1,8 +1,8 @@
-"""Targeted checks for assessment history persistence (Phase 5).
+"""JSON history persistence, compatibility and write-failure checks.
 
 Covers: save/load round-trip, record creation, and deletion. Pure Python/JSON,
 no Streamlit/ChromaDB/LLM dependencies.
-Run: python -m pytest test_assessment_history.py -q
+Run: python -m pytest tests/test_assessment_history.py -q
 """
 
 import json
@@ -12,8 +12,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from assessment_history import (
+from skripsi_rag.assessment_history import (
     AssessmentRecord,
+    HistoryReadError,
     delete_record,
     load_history,
     record_from_analysis,
@@ -253,3 +254,58 @@ def test_load_history_skips_malformed_records():
         loaded = load_history(path)
         assert len(loaded) == 1
         assert loaded[0].cve_id == "ok"
+
+
+def _record_for_write_test():
+    return record_from_analysis(
+        cve_id="CVE-2024-1234", asset_metadata={"asset_id": "TEST"},
+        base_score=9.8, context_score=None, priority=None, llm_priority=None,
+        vector_string="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        modified_vector="", retrieval_confidence=None,
+    )
+
+
+@pytest.mark.parametrize("payload", [b"not JSON", b"{}", b'[{"invalid":"record"}]', b"\xff\xfe"])
+@pytest.mark.parametrize("operation", ["save", "delete"])
+def test_invalid_history_is_not_overwritten(tmp_path, payload, operation):
+    path = tmp_path / "history.json"
+    path.write_bytes(payload)
+    record = _record_for_write_test()
+    with pytest.raises(HistoryReadError):
+        if operation == "save":
+            save_assessment(record, str(path))
+        else:
+            delete_record(record, str(path))
+    assert path.read_bytes() == payload
+    assert not list(tmp_path.glob(".assessment-history-*.tmp"))
+
+
+def test_replace_failure_preserves_previous_history(tmp_path, monkeypatch):
+    from skripsi_rag import assessment_history
+
+    path = tmp_path / "history.json"
+    save_assessment(_record_for_write_test(), str(path))
+    previous = path.read_bytes()
+
+    def fail_replace(*args):
+        raise OSError("Synthetic replacement failure")
+
+    monkeypatch.setattr(assessment_history.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replacement failure"):
+        save_assessment(_record_for_write_test(), str(path))
+    assert path.read_bytes() == previous
+    assert len(load_history(str(path), strict=True)) == 1
+    assert not list(tmp_path.glob(".assessment-history-*.tmp"))
+
+
+@pytest.mark.parametrize("invalid", [object(), float("nan")])
+def test_serialization_failure_preserves_previous_history(tmp_path, invalid):
+    path = tmp_path / "history.json"
+    save_assessment(_record_for_write_test(), str(path))
+    previous = path.read_bytes()
+    record = _record_for_write_test()
+    record.evidence = {"invalid": invalid}
+    with pytest.raises((TypeError, ValueError)):
+        save_assessment(record, str(path))
+    assert path.read_bytes() == previous
+    assert not list(tmp_path.glob(".assessment-history-*.tmp"))

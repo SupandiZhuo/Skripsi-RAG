@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cvss_engine import build_environmental_vector, calculate_cvss, validate_base_vector
+from skripsi_rag.cvss_engine import build_environmental_vector, calculate_cvss, validate_base_vector
 
 BASE = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
 

@@ -8,41 +8,35 @@ import json
 import os
 from typing import Any, Mapping
 
-from rag_retrieval import (
+from skripsi_rag.rag_retrieval import (
     CONTEXT_COLLECTION_NAME, context_chunk_id, document_provenance_error,
 )
 
-from asset_schema_v2 import UNKNOWN, V2_COLUMNS, load_assets, validate_csv
+from skripsi_rag.asset_schema_v2 import UNKNOWN, V2_COLUMNS, load_assets, validate_csv
 
-# 1. Konfigurasi
-CSV_FILE = "asset_data.csv"
+CSV_FILE = os.path.join("data", "examples", "asset_data_v1.csv")
 CHROMA_PERSIST_DIR = "./chroma_db"
 COLLECTION_NAME = "corporate_assets"
 
-# Asset Schema v2 (Phase 2A): ingested into a separate collection so the
-# original corporate_assets collection and the v1 workflow stay untouched.
-CSV_FILE_V2 = os.path.join("data", "asset_data_v2.csv")
+# Keep v2 assets separate so legacy ingestion remains unaffected.
+CSV_FILE_V2 = os.path.join("data", "examples", "asset_data_v2.csv")
 COLLECTION_NAME_V2 = "corporate_assets_v2"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 def ingest_to_chromadb():
-    print("⏳ Memulai proses data ingestion ke ChromaDB...")
-    
-    # 2. Baca CSV menggunakan Pandas
+    print("Memulai proses data ingestion ke ChromaDB...")
+
     try:
         df = pd.read_csv(CSV_FILE)
-        print(f"✅ Berhasil membaca {len(df)} baris data dari {CSV_FILE}")
+        print(f"Berhasil membaca {len(df)} baris data dari {CSV_FILE}")
     except FileNotFoundError:
-        print(f"❌ Error: File {CSV_FILE} tidak ditemukan. Pastikan file ada di folder yang sama.")
+        print(f"Error: File {CSV_FILE} tidak ditemukan.")
         return
 
-    # 3. Konversi baris CSV menjadi LangChain Documents
     documents = []
     for index, row in df.iterrows():
-        # Text yang akan di-vektorisasi untuk keperluan pencarian semantik (Similarity Search)
         page_content = f"Asset Name: {row['asset_name']}. Description: {row['description']}"
-        
-        # Metadata murni untuk diumpankan ke LLM sebagai konteks aturan lingkungan (Environmental Metrics)
+
         metadata = {
             "asset_id": row["asset_id"],
             "asset_name": row["asset_name"],
@@ -51,29 +45,24 @@ def ingest_to_chromadb():
             "data_sensitivity": row["data_sensitivity"],
             "ip_address": row["ip_address"]
         }
-        
+
         doc = Document(page_content=page_content, metadata=metadata)
         documents.append(doc)
 
-    # 4. Inisialisasi Model Embedding (Lokal & Gratis)
-    print("⏳ Mengunduh/Memuat model embedding (HuggingFace all-MiniLM-L6-v2)...")
+    print("Mengunduh/Memuat model embedding (HuggingFace all-MiniLM-L6-v2)...")
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-    # 5. Masukkan ke ChromaDB dan simpan di penyimpanan lokal (Persistent)
-    print(f"⏳ Menyimpan vektor ke direktori {CHROMA_PERSIST_DIR}...")
+    print(f"Menyimpan vektor ke direktori {CHROMA_PERSIST_DIR}...")
     vector_store = Chroma.from_documents(
         documents=documents,
         embedding=embeddings,
         collection_name=COLLECTION_NAME,
         persist_directory=CHROMA_PERSIST_DIR
     )
-    
-    print("✅ Ingestion selesai! Database RAG Anda sudah siap.")
+
+    print("Ingestion selesai.")
     return vector_store
 
-# ==========================================
-# INGESTION ASSET SCHEMA v2 (Phase 2A)
-# ==========================================
 def _clean_v2_value(value: Any) -> str:
     """Normalize a schema v2 cell into a safe, non-empty metadata string.
 
@@ -154,7 +143,7 @@ def ingest_v2_to_chromadb(
     deterministic asset_id-based IDs, so reruns never create duplicates
     and the original corporate_assets collection is never touched.
     """
-    print(f"⏳ Memulai ingestion Asset Schema v2 dari {csv_file}...")
+    print(f"Memulai ingestion Asset Schema v2 dari {csv_file}...")
 
     errors = validate_csv(csv_file)
     if errors:
@@ -162,57 +151,54 @@ def ingest_v2_to_chromadb(
             f"Asset Schema v2 validation failed for {csv_file} "
             f"({len(errors)} error(s)):\n  - " + "\n  - ".join(errors)
         )
-    print(f"✅ Skema v2 valid: {len(load_assets(csv_file))} baris lolos validasi")
+    print(f"Skema v2 valid: {len(load_assets(csv_file))} baris lolos validasi")
 
-    rows = load_assets(csv_file)
+    return _upsert_v2_assets(load_assets(csv_file), collection_name, persist_directory, embeddings)
+
+
+def _upsert_v2_assets(rows, collection_name, persist_directory, embeddings):
+    """Store already validated rows; read back exact metadata and content."""
     documents = [build_v2_document(row) for row in rows]
     ids = [document_id(row.get("asset_id")) for row in rows]
 
     if embeddings is None:
-        print(f"⏳ Mengunduh/Memuat model embedding (HuggingFace {EMBEDDING_MODEL_NAME})...")
+        print(f"Mengunduh/Memuat model embedding (HuggingFace {EMBEDDING_MODEL_NAME})...")
         embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
 
-    print(f"⏳ Menyimpan vektor ke {persist_directory} koleksi '{collection_name}'...")
+    print(f"Menyimpan vektor ke {persist_directory} koleksi '{collection_name}'...")
     vector_store = Chroma(
         collection_name=collection_name,
         embedding_function=embeddings,
         persist_directory=persist_directory,
     )
     vector_store.add_documents(documents=documents, ids=ids)
+    saved = vector_store.get(ids=ids, include=["documents", "metadatas"])
+    actual = {key: (text, metadata) for key, text, metadata in zip(
+        saved.get("ids", []), saved.get("documents", []), saved.get("metadatas", []))}
+    if len(actual) != len(documents) or any(
+        actual.get(key) != (doc.page_content, doc.metadata) for key, doc in zip(ids, documents)
+    ):
+        raise RuntimeError("Asset ingestion read-back verification failed")
 
     print(
-        f"✅ Ingestion v2 selesai: {len(documents)} aset di koleksi "
+        f"Ingestion v2 selesai: {len(documents)} aset di koleksi "
         f"'{collection_name}' (upsert, ID deterministik)."
     )
     return vector_store
 
 
-# ==========================================
-# FUNGSI TESTING (Untuk Vibe Coding)
-# ==========================================
-def test_retrieval():
-    print("\n🔍 Mari kita tes mesin pencari RAG kita...")
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    vector_store = Chroma(
-        collection_name=COLLECTION_NAME,
-        persist_directory=CHROMA_PERSIST_DIR,
-        embedding_function=embeddings
-    )
-    
-    # Simulasi input dari user di Streamlit
-    query = "Server database untuk transaksi keuangan kartu kredit"
-    print(f"Query User: '{query}'")
-    
-    # Mencari 1 aset paling mirip (k=1)
-    results = vector_store.similarity_search(query, k=1)
-    
-    if results:
-        print("\n🎯 HASIL PENCARIAN TERATAS:")
-        print(f"ID Aset     : {results[0].metadata['asset_id']}")
-        print(f"Nama Aset   : {results[0].metadata['asset_name']}")
-        print(f"Konteks RAG : {results[0].metadata}")
-    else:
-        print("❌ Tidak ada aset yang cocok.")
+def ingest_orion_package(directory, persist_directory=CHROMA_PERSIST_DIR, embeddings=None):
+    """Import supplied demo assets/software and attributed baseline documents."""
+    from skripsi_rag.asset_package import load_orion_package
+
+    package = load_orion_package(directory)  # Reject invalid packages before opening Chroma.
+    if embeddings is None:
+        embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    context_store = ingest_context_to_chromadb(package["context_path"], persist_directory, embeddings)
+    asset_store = _upsert_v2_assets(package["assets"], COLLECTION_NAME_V2, persist_directory, embeddings)
+    return asset_store, context_store, package["summary"]
+
+
 
 def build_context_documents(
     record: Mapping[str, Any], chunk_size: int = 1600, chunk_overlap: int = 200,
@@ -348,12 +334,26 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--v2", action="store_true", help="Ingest the Schema v2 asset CSV")
     mode.add_argument("--context-jsonl", metavar="PATH", help="Ingest organizational documents, not asset rows")
-    parser.add_argument("--validate-only", action="store_true", help="Validate context JSONL without database writes or model downloads")
+    mode.add_argument("--orion-package", metavar="DIRECTORY", help="Import Orion demo assets, software and baseline documents")
+    parser.add_argument("--asset-csv", metavar="PATH", help="Schema v2 CSV path (requires --v2)")
+    parser.add_argument("--validate-only", action="store_true", help="Validate context JSONL or Orion package without database writes or model downloads")
     parser.add_argument("--persist-directory", default=CHROMA_PERSIST_DIR)
     args = parser.parse_args(argv)
-    if args.validate_only and not args.context_jsonl:
-        parser.error("--validate-only requires --context-jsonl")
-    if args.context_jsonl:
+    if args.asset_csv and not args.v2:
+        parser.error("--asset-csv requires --v2")
+    if args.validate_only and not (args.context_jsonl or args.orion_package):
+        parser.error("--validate-only requires --context-jsonl or --orion-package")
+    if args.orion_package:
+        if args.validate_only:
+            from skripsi_rag.asset_package import load_orion_package
+            summary = load_orion_package(args.orion_package)["summary"]
+            print(json.dumps(summary, indent=2))
+            print("Package validated; no database writes or model downloads.")
+        else:
+            _, _, summary = ingest_orion_package(args.orion_package, args.persist_directory)
+            print(json.dumps(summary, indent=2))
+            print("Orion package ingestion verified. Demo asset classifications remain synthetic; software inventory remains unverified.")
+    elif args.context_jsonl:
         if args.validate_only:
             records = load_context_jsonl(args.context_jsonl)
             print(f"Validated {len(records)} organizational documents; no database writes.")
@@ -361,7 +361,7 @@ def main(argv=None):
             store = ingest_context_to_chromadb(args.context_jsonl, persist_directory=args.persist_directory)
             print(f"Organizational context ingestion verified in '{CONTEXT_COLLECTION_NAME}' ({store._collection.count()} chunks total).")
     elif args.v2:
-        ingest_v2_to_chromadb(persist_directory=args.persist_directory)
+        ingest_v2_to_chromadb(csv_file=args.asset_csv or CSV_FILE_V2, persist_directory=args.persist_directory)
     else:
         if args.persist_directory != CHROMA_PERSIST_DIR:
             parser.error("Custom --persist-directory requires --v2 or --context-jsonl")

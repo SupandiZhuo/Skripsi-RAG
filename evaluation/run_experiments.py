@@ -91,7 +91,7 @@ def open_document_store(persist_directory, config):
     from chromadb import PersistentClient
     from langchain_chroma import Chroma
     from langchain_huggingface import HuggingFaceEmbeddings
-    from rag_retrieval import CONTEXT_COLLECTION_NAME
+    from skripsi_rag.rag_retrieval import CONTEXT_COLLECTION_NAME
     if not persist_directory or not Path(persist_directory).is_dir():
         raise ValueError("E3 requires an existing document-store directory.")
     client = PersistentClient(path=str(persist_directory))
@@ -123,8 +123,8 @@ def run_batch(scenarios, assets, snapshots_dir, output_dir, config: ExperimentCo
         raise ValueError("No scenarios supplied. No research data will be synthesized.")
     if "E3" in config.experiments and context_store is None:
         raise ValueError("E3 requires an existing organizational document store.")
-    from nvd_client import load_nvd_snapshot
-    from pipeline import run_assessment
+    from skripsi_rag.nvd_client import load_nvd_snapshot
+    from skripsi_rag.pipeline import run_assessment
     random.seed(config.seed)
     batch_id = str(uuid.uuid4())
     output = Path(output_dir)

@@ -1,0 +1,43 @@
+x-runtime: &runtime
+  build: .
+  image: skripsi-rag:local
+  environment:
+    GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.1-flash-lite}
+
+services:
+  app:
+    <<: *runtime
+    ports:
+      - "127.0.0.1:${APP_PORT:-8501}:8501"
+    volumes:
+      - chroma-data:/app/chroma_db
+      - app-data:/app/data
+      - nvd-cache:/app/.cache/nvd
+      - model-cache:/home/app/.cache/huggingface
+    restart: unless-stopped
+
+  # Run once explicitly. Ordinary app restarts must not overwrite asset edits.
+  init:
+    <<: *runtime
+    profiles: [setup]
+    command: [python, scripts/ingest_assets.py, --orion-package, /inputs/orion]
+    healthcheck:
+      disable: true
+    volumes:
+      - chroma-data:/app/chroma_db
+      - app-data:/app/data
+      - nvd-cache:/app/.cache/nvd
+      - model-cache:/home/app/.cache/huggingface
+      - type: bind
+        source: ${ORION_PACKAGE_PATH:-./data/private/orion}
+        target: /inputs/orion
+        read_only: true
+        bind:
+          create_host_path: false
+    restart: "no"
+
+volumes:
+  chroma-data:
+  app-data:
+  nvd-cache:
+  model-cache:

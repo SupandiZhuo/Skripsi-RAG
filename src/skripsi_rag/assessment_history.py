@@ -1,23 +1,22 @@
-"""Minimal assessment history persistence (Phase 5).
+"""Persist assessment traces as a JSON array, including evidence and model payloads.
 
-Stores completed vulnerability assessments as JSON lines/objects in
-`data/assessment_history.json` so the Analysis History page can display them
-without introducing a database. The file is created on first save if it does
-not exist.
-
-This module is intentionally small: it records only assessment metadata,
-scores, and references to evidence — not full ChromaDB documents or LLM
-internals, to keep the file bounded and human-readable.
+Writes replace the file atomically and reject unreadable or malformed history.
+This single-user store does not coordinate concurrent writers.
 """
 
 import json
 import os
+import tempfile
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
 
 HISTORY_PATH = "data/assessment_history.json"
+
+
+class HistoryReadError(ValueError):
+    """Existing history cannot be loaded without losing data."""
 
 
 @dataclass
@@ -32,15 +31,14 @@ class AssessmentRecord:
     llm_priority: Optional[str]
     vector_string: str
     modified_vector: str
-    retrieval_confidence: Optional[float]
+    retrieval_confidence: Optional[float]  # Legacy name for retrieval relevance, not probability.
     evidence: Dict[str, Any]
-    # Unique id for reliable deletion (added Phase 4; missing in legacy records).
+    # Older history records may not have an ID.
     id: Optional[str] = None
-    # Phase A: CPE-based applicability (optional for backward compatibility)
+    # Optional fields allow older history records to load.
     applicability: Optional[str] = None
     applicability_explanation: Optional[str] = None
     applicability_evidence: Optional[List[Dict[str, Any]]] = None
-    # Phase C: deterministic organizational priority evidence
     priority_status: Optional[str] = None
     priority_score: Optional[int] = None
     priority_explanation: Optional[str] = None
@@ -58,33 +56,57 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def load_history(path: str = HISTORY_PATH) -> List[AssessmentRecord]:
-    if not os.path.exists(path):
-        return []
+def load_history(path: str = HISTORY_PATH, *, strict: bool = False) -> List[AssessmentRecord]:
+    """Read compatible records; strict mode rejects errors and discarded entries."""
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-    except (json.JSONDecodeError, OSError):
-        # Corrupt or unreadable history file should not crash the UI.
+    except FileNotFoundError:
+        return []
+    except (json.JSONDecodeError, UnicodeError, OSError) as exc:
+        if strict:
+            raise HistoryReadError(f"Assessment history cannot be read ({type(exc).__name__}).") from exc
         return []
     if not isinstance(data, list):
+        if strict:
+            raise HistoryReadError("Assessment history must contain a JSON array.")
         return []
     records = []
     for item in data:
         try:
             records.append(AssessmentRecord(**item))
-        except TypeError:
-            # Skip malformed records rather than crashing the history page.
+        except TypeError as exc:
+            if strict:
+                raise HistoryReadError("Assessment history contains a malformed record.") from exc
             continue
     return records
 
 
+def _write_history(history: List[AssessmentRecord], path: str) -> None:
+    directory = os.path.dirname(os.fspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                         prefix=".assessment-history-", suffix=".tmp", delete=False) as handle:
+            temporary = handle.name
+            json.dump([asdict(record) for record in history], handle, indent=2, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            try:
+                os.remove(temporary)
+            except FileNotFoundError:
+                pass
+
+
 def save_assessment(record: AssessmentRecord, path: str = HISTORY_PATH) -> None:
-    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-    history = load_history(path)
+    history = load_history(path, strict=True)
     history.append(record)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump([asdict(r) for r in history], handle, indent=2)
+    _write_history(history, path)
 
 
 def record_from_analysis(
@@ -150,7 +172,7 @@ def clear_history(path: str = HISTORY_PATH) -> None:
 
 
 def _record_identity(r: AssessmentRecord) -> tuple:
-    """Value-based identity for deduplication/deletion."""
+    """Fallback deletion identity for records without IDs."""
     return (r.timestamp, r.cve_id, r.asset_id, r.base_score, r.context_score)
 
 
@@ -160,12 +182,10 @@ def delete_record(record: AssessmentRecord, path: str = HISTORY_PATH) -> None:
     Uses the record's unique id when available; falls back to value-based
     identity only for legacy records that lack an id.
     """
-    history = load_history(path)
+    history = load_history(path, strict=True)
     if record.id:
         history = [r for r in history if r.id != record.id]
     else:
         target = _record_identity(record)
         history = [r for r in history if _record_identity(r) != target]
-    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump([asdict(r) for r in history], handle, indent=2)
+    _write_history(history, path)
